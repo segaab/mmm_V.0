@@ -1,7 +1,8 @@
 streamlit
 pandas
+setuptools
+wheels
 numpy
-time
 json
 requests
 datetime
