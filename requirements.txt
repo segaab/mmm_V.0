@@ -1,7 +1,10 @@
 
 streamlit
 pandas
-numpy--v
+numpy==2.3.2  
+numpy==2.3.0  
+numpy==2.2.6  
+numpy==2.1.0
 json
 requests
 datetime
