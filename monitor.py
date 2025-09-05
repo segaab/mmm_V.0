@@ -1,3 +1,393 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import time
+import json
+import requests
+from datetime import datetime, timedelta
+import threading
+import pytz
+import io
+import base64
+from streamlit_javascript import st_javascript
+import random
+
+st.set_page_config(page_title="Market Monitor", layout="wide")
+
+# Constants
+API_KEY = st.secrets["FINAGE_API_KEY"] if "FINAGE_API_KEY" in st.secrets else st.text_input("Enter Finage API Key", type="password")
+REST_API_BASE_URL = "https://api.finage.co.uk"
+
+# Market categories and symbols
+MARKETS = {
+    "Forex": ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD", "EURJPY", "GBPJPY", "EURGBP"],
+    "Indices": ["SPX", "IXIC", "DJI", "FTSE", "DAX", "CAC", "N225", "HSI", "SSEC"],
+    "Commodities": ["XAUUSD", "XAGUSD", "CL", "BZ", "NG"],
+    "Metals": ["HG", "PL", "PA", "SI", "GC"]
+}
+
+# Available timeframes (minimum 1 hour)
+TIMEFRAMES = {
+    "1h": "hour",
+    "4h": "hour",
+    "1d": "day",
+    "1w": "week",
+    "1m": "month"
+}
+
+# Chart types
+CHART_TYPES = ["Candlestick", "Line", "Heikin-Ashi"]
+
+# Cache management
+class DataCache:
+    def __init__(self, cache_duration=3600):  # Cache duration in seconds (1 hour default)
+        self.historical_data = {}
+        self.live_data = {}
+        self.last_update = {}
+        self.cache_duration = cache_duration
+        
+    def set_historical(self, symbol, timeframe, data):
+        cache_key = f"{symbol}_{timeframe}"
+        self.historical_data[cache_key] = data
+        self.last_update[cache_key] = datetime.now()
+        
+    def get_historical(self, symbol, timeframe):
+        cache_key = f"{symbol}_{timeframe}"
+        if cache_key in self.historical_data:
+            elapsed = (datetime.now() - self.last_update[cache_key]).total_seconds()
+            if elapsed < self.cache_duration:
+                return self.historical_data[cache_key]
+        return None
+    
+    def update_live(self, symbol, data):
+        self.live_data[symbol] = data
+        
+    def get_live(self, symbol):
+        return self.live_data.get(symbol)
+    
+    def get_all_live(self):
+        return self.live_data
+
+# Initialize cache
+cache = DataCache()
+
+# Rate limiter for REST API
+class RateLimiter:
+    def __init__(self, calls_per_minute=5, calls_per_day=500):
+        self.calls_per_minute = calls_per_minute
+        self.calls_per_day = calls_per_day
+        self.daily_calls = 0
+        self.minute_calls = 0
+        self.last_reset_minute = datetime.now()
+        self.last_reset_day = datetime.now().date()
+        self.lock = threading.Lock()
+    
+    def check_and_increment(self):
+        with self.lock:
+            current_time = datetime.now()
+            current_date = current_time.date()
+            
+            # Reset daily counter if day changed
+            if current_date > self.last_reset_day:
+                self.daily_calls = 0
+                self.last_reset_day = current_date
+                
+            # Reset minute counter if minute changed
+            if (current_time - self.last_reset_minute).total_seconds() >= 60:
+                self.minute_calls = 0
+                self.last_reset_minute = current_time
+                
+            # Check if we can make a call
+            if self.daily_calls >= self.calls_per_day:
+                return False
+            
+            if self.minute_calls >= self.calls_per_minute:
+                return False
+                
+            # Increment counters
+            self.daily_calls += 1
+            self.minute_calls += 1
+            return True
+
+# Initialize rate limiter
+rate_limiter = RateLimiter()
+
+# Function to fetch live price data via REST API
+def fetch_live_price(symbol):
+    if not API_KEY:
+        return None
+    
+    # Check rate limiter
+    if not rate_limiter.check_and_increment():
+        st.warning(f"Rate limit reached. Skipping live data fetch for {symbol}")
+        return None
+    
+    # Determine API endpoint based on symbol type
+    if any(symbol in MARKETS[category] for category in ["Forex", "Metals"]):
+        endpoint = f"{REST_API_BASE_URL}/last/forex/{symbol}"
+    elif any(symbol in MARKETS[category] for category in ["Indices"]):
+        endpoint = f"{REST_API_BASE_URL}/last/index/{symbol}"
+    else:  # Default to stock/commodity endpoint
+        endpoint = f"{REST_API_BASE_URL}/last/stock/{symbol}"
+    
+    try:
+        response = requests.get(f"{endpoint}?apikey={API_KEY}")
+        if response.status_code == 200:
+            data = response.json()
+            # Update cache with live data
+            cache.update_live(symbol, {
+                "price": data.get("price", 0),
+                "timestamp": data.get("timestamp", int(time.time() * 1000)),
+                "volume": data.get("volume", 0)
+            })
+            return data
+        else:
+            st.error(f"API error ({response.status_code}): {response.text}")
+            return None
+    except Exception as e:
+        st.error(f"Error fetching live data: {e}")
+        return None
+
+# Function to update live prices for multiple symbols
+def update_live_prices(symbols, use_real_api=True):
+    for symbol in symbols:
+        if use_real_api and API_KEY:
+            fetch_live_price(symbol)
+        else:
+            # Generate placeholder data
+            base_price = 100
+            if symbol.startswith("EUR"):
+                base_price = 1.1
+            elif symbol.startswith("GBP"):
+                base_price = 1.3
+            elif symbol.startswith("USD"):
+                base_price = 0.9
+            elif symbol.startswith("XAU"):
+                base_price = 2000
+            elif symbol.startswith("XAG"):
+                base_price = 25
+            
+            # Get existing price if available or use base price
+            current_data = cache.get_live(symbol)
+            if current_data:
+                current_price = current_data["price"]
+            else:
+                current_price = base_price
+            
+            # Add some random movement
+            new_price = current_price * (1 + (random.random() - 0.5) * 0.005)  # ±0.25% change
+            
+            # Update cache
+            cache.update_live(symbol, {
+                "price": new_price,
+                "timestamp": int(time.time() * 1000),
+                "volume": int(random.random() * 10000)
+            })
+
+# Function to fetch historical data via REST API
+def fetch_historical_data(symbol, timeframe="day", days=30):
+    if not API_KEY:
+        return None
+    
+    # Check rate limiter
+    if not rate_limiter.check_and_increment():
+        st.warning(f"Rate limit reached. Skipping historical data fetch for {symbol}")
+        return None
+    
+    # Check cache first
+    cached_data = cache.get_historical(symbol, timeframe)
+    if cached_data is not None:
+        return cached_data
+    
+    # Calculate date range
+    end_date = datetime.now().date()
+    start_date = end_date - timedelta(days=days)
+    
+    # Format dates for API
+    from_date = start_date.strftime("%Y-%m-%d")
+    to_date = end_date.strftime("%Y-%m-%d")
+    
+    # Determine API endpoint based on symbol type
+    if any(symbol in MARKETS[category] for category in ["Forex", "Metals"]):
+        endpoint = f"{REST_API_BASE_URL}/agg/forex/{symbol}/1/{timeframe}/{from_date}/{to_date}"
+    elif any(symbol in MARKETS[category] for category in ["Indices"]):
+        endpoint = f"{REST_API_BASE_URL}/agg/index/{symbol}/1/{timeframe}/{from_date}/{to_date}"
+    else:  # Default to stock/commodity endpoint
+        endpoint = f"{REST_API_BASE_URL}/agg/stock/{symbol}/1/{timeframe}/{from_date}/{to_date}"
+    
+    try:
+        response = requests.get(f"{endpoint}?apikey={API_KEY}")
+        if response.status_code == 200:
+            data = response.json()
+            # Cache the result
+            cache.set_historical(symbol, timeframe, data)
+            return data
+        else:
+            st.error(f"API error ({response.status_code}): {response.text}")
+            return None
+    except Exception as e:
+        st.error(f"Error fetching historical data: {e}")
+        return None
+
+# Function to convert historical data to chart format
+def prepare_chart_data(symbol, timeframe="day", days=30):
+    data = fetch_historical_data(symbol, timeframe, days)
+    if not data or "results" not in data:
+        # Generate placeholder data if we don't have real data
+        # This is useful for demo/testing without API key
+        return generate_placeholder_data(symbol, timeframe, days)
+    
+    results = data["results"]
+    chart_data = []
+    
+    for item in results:
+        chart_data.append({
+            "time": item["t"] / 1000,  # Convert milliseconds to seconds for chart
+            "open": item["o"],
+            "high": item["h"],
+            "low": item["l"],
+            "close": item["c"],
+            "volume": item.get("v", 0)
+        })
+    
+    return chart_data
+
+# Generate placeholder data for demo/testing
+def generate_placeholder_data(symbol, timeframe="day", days=30):
+    chart_data = []
+    end_time = int(time.time())
+    
+    # Determine time interval based on timeframe
+    if timeframe == "hour":
+        if days <= 7:  # For 1h timeframe
+            interval = 3600
+        else:  # For 4h timeframe
+            interval = 14400
+    elif timeframe == "day":
+        interval = 86400
+    elif timeframe == "week":
+        interval = 604800
+    else:  # month
+        interval = 2592000
+    
+    base_price = 100
+    if symbol.startswith("EUR"):
+        base_price = 1.1
+    elif symbol.startswith("GBP"):
+        base_price = 1.3
+    elif symbol.startswith("USD"):
+        base_price = 0.9
+    elif symbol.startswith("XAU"):
+        base_price = 2000
+    elif symbol.startswith("XAG"):
+        base_price = 25
+    
+    # Generate random walk data
+    for i in range(days):
+        time_point = end_time - (interval * (days - i))
+        
+        if i == 0:
+            close = base_price
+        else:
+            # Random walk with some volatility
+            change = (random.random() - 0.5) * base_price * 0.02
+            close = chart_data[-1]["close"] + change
+        
+        # Create some reasonable OHLC spread
+        high = close * (1 + random.random() * 0.01)
+        low = close * (1 - random.random() * 0.01)
+        open_price = low + random.random() * (high - low)
+        volume = int(random.random() * 10000)
+        
+        chart_data.append({
+            "time": time_point,
+            "open": open_price,
+            "high": high,
+            "low": low,
+            "close": close,
+            "volume": volume
+        })
+    
+    return chart_data
+
+# Calculate Heikin-Ashi data from regular OHLC data
+def calculate_heikin_ashi(ohlc_data):
+    ha_data = []
+    
+    for i, candle in enumerate(ohlc_data):
+        if i == 0:
+            # First candle
+            ha_open = (candle["open"] + candle["close"]) / 2
+            ha_close = (candle["open"] + candle["high"] + candle["low"] + candle["close"]) / 4
+            ha_high = candle["high"]
+            ha_low = candle["low"]
+        else:
+            # Subsequent candles
+            prev_ha = ha_data[-1]
+            ha_open = (prev_ha["open"] + prev_ha["close"]) / 2
+            ha_close = (candle["open"] + candle["high"] + candle["low"] + candle["close"]) / 4
+            ha_high = max(candle["high"], ha_open, ha_close)
+            ha_low = min(candle["low"], ha_open, ha_close)
+        
+        ha_data.append({
+            "time": candle["time"],
+            "open": ha_open,
+            "high": ha_high,
+            "low": ha_low,
+            "close": ha_close,
+            "volume": candle["volume"]
+        })
+    
+    return ha_data
+
+# Alert system
+class AlertSystem:
+    def __init__(self):
+        self.alerts = {}
+        
+    def add_alert(self, symbol, condition, target_price, message):
+        if symbol not in self.alerts:
+            self.alerts[symbol] = []
+        
+        self.alerts[symbol].append({
+            "condition": condition,  # "above" or "below"
+            "price": target_price,
+            "message": message,
+            "triggered": False,
+            "created_at": datetime.now()
+        })
+        
+    def check_alerts(self, symbol, current_price):
+        if symbol not in self.alerts:
+            return []
+        
+        triggered_alerts = []
+        
+        for i, alert in enumerate(self.alerts[symbol]):
+            if alert["triggered"]:
+                continue
+                
+            if alert["condition"] == "above" and current_price >= alert["price"]:
+                alert["triggered"] = True
+                triggered_alerts.append(alert["message"])
+            elif alert["condition"] == "below" and current_price <= alert["price"]:
+                alert["triggered"] = True
+                triggered_alerts.append(alert["message"])
+        
+        # Remove triggered alerts
+        self.alerts[symbol] = [a for a in self.alerts[symbol] if not a["triggered"]]
+        
+        return triggered_alerts
+    
+    def get_active_alerts(self, symbol=None):
+        if symbol:
+            return self.alerts.get(symbol, [])
+        return self.alerts
+
+# Initialize alert system
+alert_system = AlertSystem()
+
+
 # Streamlit UI components
 def render_tradingview_chart(symbol, chart_data, container_id, chart_type="Candlestick", height=400):
     # Apply appropriate data transformation based on chart type
