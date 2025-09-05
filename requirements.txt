@@ -4,4 +4,4 @@ numpy==2.3.2
 requests
 pytz
 streamlit-javascript
-streqmlit_autorefresh
+streamlit-autorefresh
