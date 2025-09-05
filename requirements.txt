@@ -1,11 +1,6 @@
-streamlit
-pandas
-json
+streamlit==1.49.1
+pandas==2.3.2
+numpy==2.3.2
 requests
-datetime
-threading
 pytz
-io
-base64
-streamlit_javascript
-random
+streamlit-javascript
