@@ -217,8 +217,6 @@ def fetch_historical_data(symbol, timeframe="day", days=30):
         st.error(f"Error fetching historical data: {e}")
         return None
 
-
-
 # Function to convert historical data to chart format
 def prepare_chart_data(symbol, timeframe="day", days=30):
     data = fetch_historical_data(symbol, timeframe, days)
@@ -691,8 +689,9 @@ def build_dashboard():
     if refresh_seconds > 0:
         st.empty()
         time.sleep(min(refresh_seconds, 10))  # Cap at 10 seconds to avoid blocking UI
-        st.experimental_rerun()
+        st.rerun()
 
 # Run the dashboard
 if __name__ == "__main__":
     build_dashboard()
+                              
