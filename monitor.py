@@ -669,18 +669,6 @@ def build_dashboard():
         else:
             st.info("No active alerts")
         
-        # Market calendar/news
-        st.header("Market Calendar")
-        today = datetime.now().date()
-        
-        # Dummy market events
-        events = [
-            {"time": "08:30", "event": "US Non-Farm Payrolls", "impact": "High"},
-            {"time": "10:00", "event": "ECB Interest Rate Decision", "impact": "High"},
-            {"time": "12:30", "event": "US GDP", "impact": "Medium"},
-            {"time": "14:00", "event": "Fed Chair Speech", "impact": "High"},
-        ]
-        
         events_df = pd.DataFrame(events)
         st.dataframe(events_df, use_container_width=True)
     
@@ -689,7 +677,7 @@ def build_dashboard():
     if refresh_seconds > 0:
         st.empty()
         time.sleep(min(refresh_seconds, 10))  # Cap at 10 seconds to avoid blocking UI
-        st.experimental_rerun()
+        st.rerun()
 
 # Run the dashboard
 if __name__ == "__main__":
