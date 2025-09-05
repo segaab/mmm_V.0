@@ -491,5 +491,5 @@ def build_dashboard():
            st.experimental_rerun()
 
     # Run the dashboard
-   if __name__ == "__main__":
-       build_dashboard()
+if __name__ == "__main__":
+    build_dashboard()
