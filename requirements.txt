@@ -1,7 +1,5 @@
 streamlit
 pandas
-setuptools
-wheels
 numpy
 json
 requests
