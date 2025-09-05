@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import time
 import json
-import websocket
 import requests
 from datetime import datetime, timedelta
 import threading
@@ -17,7 +16,6 @@ st.set_page_config(page_title="Market Monitor", layout="wide")
 
 # Constants
 API_KEY = st.secrets["FINAGE_API_KEY"] if "FINAGE_API_KEY" in st.secrets else st.text_input("Enter Finage API Key", type="password")
-WEBSOCKET_URL = "wss://stream.finage.co.uk/marketdata"
 REST_API_BASE_URL = "https://api.finage.co.uk"
 
 # Market categories and symbols
@@ -102,111 +100,77 @@ class RateLimiter:
 # Initialize rate limiter
 rate_limiter = RateLimiter()
 
-# WebSocket client
-class FinageWebSocket:
-    def __init__(self):
-        self.ws = None
-        self.is_connected = False
-        self.subscribed_symbols = set()
-        self.connect_thread = None
-        
-    def on_message(self, ws, message):
-        try:
-            data = json.loads(message)
-            if "symbol" in data and "price" in data:
-                symbol = data["symbol"]
-                price = data["price"]
-                timestamp = data.get("timestamp", int(time.time() * 1000))
-                volume = data.get("volume", 0)
-                
-                # Update cache with live data
-                cache.update_live(symbol, {
-                    "price": price,
-                    "timestamp": timestamp,
-                    "volume": volume
-                })
-        except Exception as e:
-            st.error(f"WebSocket message error: {e}")
+# Function to fetch live price data via REST API
+def fetch_live_price(symbol):
+    if not API_KEY:
+        return None
     
-    def on_error(self, ws, error):
-        st.error(f"WebSocket error: {error}")
-        self.is_connected = False
+    # Check rate limiter
+    if not rate_limiter.check_and_increment():
+        st.warning(f"Rate limit reached. Skipping live data fetch for {symbol}")
+        return None
     
-    def on_close(self, ws, close_status_code, close_msg):
-        st.warning("WebSocket connection closed")
-        self.is_connected = False
-        # Try to reconnect after a delay
-        time.sleep(5)
-        self.connect()
+    # Determine API endpoint based on symbol type
+    if any(symbol in MARKETS[category] for category in ["Forex", "Metals"]):
+        endpoint = f"{REST_API_BASE_URL}/last/forex/{symbol}"
+    elif any(symbol in MARKETS[category] for category in ["Indices"]):
+        endpoint = f"{REST_API_BASE_URL}/last/index/{symbol}"
+    else:  # Default to stock/commodity endpoint
+        endpoint = f"{REST_API_BASE_URL}/last/stock/{symbol}"
     
-    def on_open(self, ws):
-        self.is_connected = True
-        st.success("WebSocket connected")
-        
-        # Authenticate
-        auth_message = json.dumps({
-            "action": "auth",
-            "apikey": API_KEY
-        })
-        ws.send(auth_message)
-        
-        # Resubscribe to symbols
-        if self.subscribed_symbols:
-            self.subscribe(list(self.subscribed_symbols))
-    
-    def connect(self):
-        if self.is_connected:
-            return
-            
-        def run_websocket():
-            self.ws = websocket.WebSocketApp(
-                WEBSOCKET_URL,
-                on_open=self.on_open,
-                on_message=self.on_message,
-                on_error=self.on_error,
-                on_close=self.on_close
-            )
-            self.ws.run_forever()
-        
-        self.connect_thread = threading.Thread(target=run_websocket)
-        self.connect_thread.daemon = True
-        self.connect_thread.start()
-    
-    def subscribe(self, symbols):
-        if not self.is_connected or not self.ws:
-            for symbol in symbols:
-                self.subscribed_symbols.add(symbol)
-            return
-            
-        # Subscribe to symbols
-        subscribe_message = json.dumps({
-            "action": "subscribe",
-            "symbols": symbols
-        })
-        self.ws.send(subscribe_message)
-        
-        # Add to subscribed set
-        for symbol in symbols:
-            self.subscribed_symbols.add(symbol)
-    
-    def unsubscribe(self, symbols):
-        if not self.is_connected or not self.ws:
-            return
-            
-        # Unsubscribe from symbols
-        unsubscribe_message = json.dumps({
-            "action": "unsubscribe",
-            "symbols": symbols
-        })
-        self.ws.send(unsubscribe_message)
-        
-        # Remove from subscribed set
-        for symbol in symbols:
-            if symbol in self.subscribed_symbols:
-                self.subscribed_symbols.remove(symbol)
+    try:
+        response = requests.get(f"{endpoint}?apikey={API_KEY}")
+        if response.status_code == 200:
+            data = response.json()
+            # Update cache with live data
+            cache.update_live(symbol, {
+                "price": data.get("price", 0),
+                "timestamp": data.get("timestamp", int(time.time() * 1000)),
+                "volume": data.get("volume", 0)
+            })
+            return data
+        else:
+            st.error(f"API error ({response.status_code}): {response.text}")
+            return None
+    except Exception as e:
+        st.error(f"Error fetching live data: {e}")
+        return None
 
-# Initialize WebSocket client
-ws_client = FinageWebSocket()
+# Function to update live prices for multiple symbols
+def update_live_prices(symbols, use_real_api=True):
+    for symbol in symbols:
+        if use_real_api and API_KEY:
+            fetch_live_price(symbol)
+        else:
+            # Generate placeholder data
+            base_price = 100
+            if symbol.startswith("EUR"):
+                base_price = 1.1
+            elif symbol.startswith("GBP"):
+                base_price = 1.3
+            elif symbol.startswith("USD"):
+                base_price = 0.9
+            elif symbol.startswith("XAU"):
+                base_price = 2000
+            elif symbol.startswith("XAG"):
+                base_price = 25
+            
+            # Get existing price if available or use base price
+            current_data = cache.get_live(symbol)
+            if current_data:
+                current_price = current_data["price"]
+            else:
+                current_price = base_price
+            
+            # Add some random movement
+            new_price = current_price * (1 + (random.random() - 0.5) * 0.005)  # ±0.25% change
+            
+            # Update cache
+            cache.update_live(symbol, {
+                "price": new_price,
+                "timestamp": int(time.time() * 1000),
+                "volume": int(random.random() * 10000)
+            })
 
 # Function to fetch historical data via REST API
 def fetch_historical_data(symbol, timeframe="day", days=30):
@@ -539,9 +503,9 @@ def render_tradingview_chart(symbol, chart_data, container_id, height=400):
 def build_dashboard():
     st.title("Market Monitor Dashboard")
     
-    # Connect to WebSocket
-    if API_KEY and not ws_client.is_connected:
-        ws_client.connect()
+    # Initialize session state for last update time if it doesn't exist
+    if 'last_update_time' not in st.session_state:
+        st.session_state.last_update_time = datetime.now() - timedelta(minutes=10)  # Force update on first run
     
     # Sidebar for settings
     with st.sidebar:
@@ -555,6 +519,18 @@ def build_dashboard():
         # Chart settings
         timeframe = st.selectbox("Timeframe", ["minute", "hour", "day", "week", "month"], index=2)
         days_lookback = st.slider("Days of History", min_value=1, max_value=90, value=30)
+        
+        # Data refresh settings
+        st.header("Data Refresh Settings")
+        use_real_api = st.checkbox("Use Real API (if API Key provided)", value=True)
+        refresh_minutes = st.number_input("Update Frequency (minutes)", min_value=1, max_value=360, value=83)
+        refresh_seconds = refresh_minutes * 60
+        
+        # Manual refresh button
+        if st.button("Refresh Data Now"):
+            update_live_prices(available_symbols, use_real_api)
+            st.session_state.last_update_time = datetime.now()
+            st.success(f"Data updated at {st.session_state.last_update_time.strftime('%H:%M:%S')}")
         
         # Alert creation
         st.header("Create Alert")
@@ -571,9 +547,16 @@ def build_dashboard():
         active_alerts = alert_system.get_active_alerts(selected_symbol)
         for i, alert in enumerate(active_alerts):
             st.write(f"{i+1}. {alert['condition'].title()} {alert['price']}: {alert['message']}")
-            
-        # Data refresh rate
-        refresh_rate = st.slider("Refresh Rate (seconds)", min_value=5, max_value=60, value=15)
+        
+        # Display time since last update
+        time_since_update = (datetime.now() - st.session_state.last_update_time).total_seconds() / 60
+        st.write(f"Last data update: {time_since_update:.1f} minutes ago")
+    
+    # Check if it's time to update data
+    time_since_update = (datetime.now() - st.session_state.last_update_time).total_seconds()
+    if time_since_update > refresh_seconds:
+        update_live_prices(available_symbols, use_real_api)
+        st.session_state.last_update_time = datetime.now()
     
     # Main dashboard area
     col1, col2 = st.columns([2, 1])
@@ -610,10 +593,6 @@ def build_dashboard():
         # Get current data for all symbols in the selected category
         live_data = {}
         for symbol in MARKETS[selected_category]:
-            # Subscribe to WebSocket for this symbol
-            if API_KEY:
-                ws_client.subscribe([symbol])
-            
             # Get live data from cache or generate placeholder
             symbol_data = cache.get_live(symbol)
             if symbol_data:
@@ -642,6 +621,12 @@ def build_dashboard():
                 "change": change,
                 "timestamp": timestamp
             }
+            
+            # Check for any triggered alerts
+            if symbol_data:
+                triggered_alerts = alert_system.check_alerts(symbol, price)
+                for alert in triggered_alerts:
+                    st.warning(f"ALERT: {alert}")
         
         # Create dataframe for the table
         market_data = []
@@ -699,11 +684,14 @@ def build_dashboard():
         events_df = pd.DataFrame(events)
         st.dataframe(events_df, use_container_width=True)
     
-    # Auto-refresh
-    if refresh_rate > 0:
-        time.sleep(refresh_rate)
+    # Auto-refresh based on refresh_seconds
+    # Note: This will refresh the entire Streamlit app, not just the data
+    if refresh_seconds > 0:
+        st.empty()
+        time.sleep(min(refresh_seconds, 10))  # Cap at 10 seconds to avoid blocking UI
         st.experimental_rerun()
 
 # Run the dashboard
 if __name__ == "__main__":
     build_dashboard()
+        
