@@ -1,9 +1,6 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 import requests
-import json
-import threading
 import time
 from datetime import datetime, timedelta
 from streamlit_autorefresh import st_autorefresh
@@ -16,25 +13,18 @@ st.set_page_config(page_title="Market Monitor", layout="wide")
 # ==============================
 # Constants and Config
 # ==============================
-API_KEY = st.secrets["FINAGE_API_KEY"] if "FINAGE_API_KEY" in st.secrets else st.text_input("Enter Finage API Key", type="password")
+API_KEY = st.secrets.get("FINAGE_API_KEY") or st.text_input("Enter Finage API Key", type="password")
 REST_API_BASE_URL = "https://api.finage.co.uk"
 
 MARKETS = {
-    "Forex": ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD", "EURJPY", "GBPJPY", "EURGBP"],
-    "Indices": ["SPX", "IXIC", "DJI", "FTSE", "DAX", "CAC", "N225", "HSI", "SSEC"],
-    "Commodities": ["XAUUSD", "XAGUSD", "CL", "BZ", "NG"],
-    "Metals": ["HG", "PL", "PA", "SI", "GC"]
+    "Forex": ["EURUSD","GBPUSD","USDJPY","AUDUSD","USDCAD","USDCHF","NZDUSD","EURJPY","GBPJPY","EURGBP"],
+    "Indices": ["SPX","IXIC","DJI","FTSE","DAX","CAC","N225","HSI","SSEC"],
+    "Commodities": ["XAUUSD","XAGUSD","CL","BZ","NG"],
+    "Metals": ["HG","PL","PA","SI","GC"]
 }
 
-TIMEFRAMES = {
-    "1h": "hour",
-    "4h": "hour",
-    "1d": "day",
-    "1w": "week",
-    "1m": "month"
-}
-
-CHART_TYPES = ["Candlestick", "Line", "Heikin-Ashi"]
+TIMEFRAMES = {"1h":"hour","4h":"hour","1d":"day","1w":"week","1m":"month"}
+CHART_TYPES = ["Candlestick","Line","Heikin-Ashi"]
 
 # ==============================
 # Data Cache
@@ -54,8 +44,7 @@ class DataCache:
     def get_historical(self, symbol, timeframe):
         key = f"{symbol}_{timeframe}"
         if key in self.historical_data:
-            elapsed = (datetime.now() - self.last_update[key]).total_seconds()
-            if elapsed < self.cache_duration:
+            if (datetime.now() - self.last_update[key]).total_seconds() < self.cache_duration:
                 return self.historical_data[key]
         return None
 
@@ -78,44 +67,60 @@ class RateLimiter:
         self.minute_calls = 0
         self.last_reset_minute = datetime.now()
         self.last_reset_day = datetime.now().date()
-        self.lock = threading.Lock()
 
     def check_and_increment(self):
-        with self.lock:
-            now = datetime.now()
-            today = now.date()
-
-            if today > self.last_reset_day:
-                self.daily_calls = 0
-                self.last_reset_day = today
-
-            if (now - self.last_reset_minute).total_seconds() >= 60:
-                self.minute_calls = 0
-                self.last_reset_minute = now
-
-            if self.daily_calls >= self.calls_per_day or self.minute_calls >= self.calls_per_minute:
-                return False
-
-            self.daily_calls += 1
-            self.minute_calls += 1
-            return True
+        now = datetime.now()
+        if now.date() > self.last_reset_day:
+            self.daily_calls = 0
+            self.last_reset_day = now.date()
+        if (now - self.last_reset_minute).total_seconds() >= 60:
+            self.minute_calls = 0
+            self.last_reset_minute = now
+        if self.daily_calls >= self.calls_per_day or self.minute_calls >= self.calls_per_minute:
+            return False
+        self.daily_calls += 1
+        self.minute_calls += 1
+        return True
 
 rate_limiter = RateLimiter()
+
+# ==============================
+# Alerts
+# ==============================
+class AlertSystem:
+    def __init__(self):
+        self.alerts = {}
+
+    def add_alert(self, symbol, condition, price, message):
+        self.alerts.setdefault(symbol, []).append({"condition": condition, "price": price, "message": message, "triggered": False})
+
+    def check_alerts(self, symbol, current_price):
+        triggered = []
+        for alert in self.alerts.get(symbol, []):
+            if not alert["triggered"]:
+                if (alert["condition"]=="above" and current_price>=alert["price"]) or (alert["condition"]=="below" and current_price<=alert["price"]):
+                    alert["triggered"] = True
+                    triggered.append(alert["message"])
+        self.alerts[symbol] = [a for a in self.alerts.get(symbol,[]) if not a["triggered"]]
+        return triggered
+
+alert_system = AlertSystem()
+
+# ==============================
+# Auto Refresh
+# ==============================
+st_autorefresh(interval=60000, key="refresh")  # Refresh every 60s
 
 # ==============================
 # Live Price Fetch
 # ==============================
 def fetch_live_price(symbol):
-    if not API_KEY:
+    if not API_KEY or not rate_limiter.check_and_increment():
         return None
 
-    if not rate_limiter.check_and_increment():
-        st.warning(f"Rate limit reached. Skipping live data for {symbol}")
-        return None
-
-    if any(symbol in MARKETS[cat] for cat in ["Forex", "Metals"]):
+    if symbol in MARKETS["Forex"] + MARKETS["Metals"]:
         endpoint = f"{REST_API_BASE_URL}/last/forex/{symbol}"
-    elif any(symbol in MARKETS[cat] for cat in ["Indices"]):
+    elif symbol in MARKETS["Indices"]:
         endpoint = f"{REST_API_BASE_URL}/last/index/{symbol}"
     else:
         endpoint = f"{REST_API_BASE_URL}/last/stock/{symbol}"
@@ -126,13 +131,11 @@ def fetch_live_price(symbol):
             data = response.json()
             cache.update_live(symbol, {
                 "price": data.get("price", 0),
-                "timestamp": data.get("timestamp", int(time.time() * 1000)),
+                "timestamp": data.get("timestamp", int(time.time()*1000)),
                 "volume": data.get("volume", 0)
             })
             return data
-        else:
-            st.error(f"API error ({response.status_code}): {response.text}")
-            return None
+        return None
     except Exception as e:
         st.error(f"Error fetching live data: {e}")
         return None
@@ -145,11 +148,7 @@ def update_live_prices(symbols):
 # Historical Data Fetch
 # ==============================
 def fetch_historical_data(symbol, timeframe="day", days=30):
-    if not API_KEY:
-        return None
-
-    if not rate_limiter.check_and_increment():
-        st.warning(f"Rate limit reached. Skipping historical data for {symbol}")
+    if not API_KEY or not rate_limiter.check_and_increment():
         return None
 
     cached = cache.get_historical(symbol, timeframe)
@@ -161,9 +160,9 @@ def fetch_historical_data(symbol, timeframe="day", days=30):
     from_date = start_date.strftime("%Y-%m-%d")
     to_date = end_date.strftime("%Y-%m-%d")
 
-    if any(symbol in MARKETS[cat] for cat in ["Forex", "Metals"]):
+    if symbol in MARKETS["Forex"] + MARKETS["Metals"]:
         endpoint = f"{REST_API_BASE_URL}/agg/forex/{symbol}/1/{timeframe}/{from_date}/{to_date}"
-    elif any(symbol in MARKETS[cat] for cat in ["Indices"]):
+    elif symbol in MARKETS["Indices"]:
         endpoint = f"{REST_API_BASE_URL}/agg/index/{symbol}/1/{timeframe}/{from_date}/{to_date}"
     else:
         endpoint = f"{REST_API_BASE_URL}/agg/stock/{symbol}/1/{timeframe}/{from_date}/{to_date}"
@@ -174,9 +173,7 @@ def fetch_historical_data(symbol, timeframe="day", days=30):
             data = response.json()
             cache.set_historical(symbol, timeframe, data)
             return data
-        else:
-            st.error(f"API error ({response.status_code}): {response.text}")
-            return None
+        return None
     except Exception as e:
         st.error(f"Error fetching historical data: {e}")
         return None
@@ -187,15 +184,12 @@ def fetch_historical_data(symbol, timeframe="day", days=30):
 def prepare_chart_data(symbol, timeframe="day", days=30):
     data = fetch_historical_data(symbol, timeframe, days)
     if not data or "results" not in data:
-        st.error(f"No historical data available for {symbol}")
         return []
 
-    results = data["results"]
     chart_data = []
-
-    for item in results:
+    for item in data["results"]:
         chart_data.append({
-            "time": item["t"] / 1000,  # Convert milliseconds to seconds
+            "time": item["t"]/1000,
             "open": item["o"],
             "high": item["h"],
             "low": item["l"],
@@ -209,20 +203,16 @@ def prepare_chart_data(symbol, timeframe="day", days=30):
 # ==============================
 def calculate_heikin_ashi(ohlc_data):
     ha_data = []
-
     for i, candle in enumerate(ohlc_data):
-        if i == 0:
-            ha_open = (candle["open"] + candle["close"]) / 2
-            ha_close = (candle["open"] + candle["high"] + candle["low"] + candle["close"]) / 4
-            ha_high = candle["high"]
-            ha_low = candle["low"]
+        if i==0:
+            ha_open = (candle["open"] + candle["close"])/2
+            ha_close = (candle["open"] + candle["high"] + candle["low"] + candle["close"])/4
         else:
             prev_ha = ha_data[-1]
-            ha_open = (prev_ha["open"] + prev_ha["close"]) / 2
-            ha_close = (candle["open"] + candle["high"] + candle["low"] + candle["close"]) / 4
-            ha_high = max(candle["high"], ha_open, ha_close)
-            ha_low = min(candle["low"], ha_open, ha_close)
-
+            ha_open = (prev_ha["open"] + prev_ha["close"])/2
+            ha_close = (candle["open"] + candle["high"] + candle["low"] + candle["close"])/4
+        ha_high = max(candle["high"], ha_open, ha_close)
+        ha_low = min(candle["low"], ha_open, ha_close)
         ha_data.append({
             "time": candle["time"],
             "open": ha_open,
@@ -231,195 +221,136 @@ def calculate_heikin_ashi(ohlc_data):
             "close": ha_close,
             "volume": candle["volume"]
         })
-
     return ha_data
 
 # ==============================
-# Alert System
+# TradingView Chart Rendering
 # ==============================
-class AlertSystem:
-    def __init__(self):
-        self.alerts = {}
+def render_tradingview_chart(symbol, chart_data, container_id, chart_type="Candlestick", height=500):
+    if chart_type == "Heikin-Ashi":
+        chart_data = calculate_heikin_ashi(chart_data)
 
-    def add_alert(self, symbol, condition, target_price, message):
-        if symbol not in self.alerts:
-            self.alerts[symbol] = []
+    # Prepare JS data array
+    js_data = [{"time": int(d["time"]), "open": d["open"], "high": d["high"],
+                "low": d["low"], "close": d["close"], "volume": d["volume"]} for d in chart_data]
 
-        self.alerts[symbol].append({
-            "condition": condition,  # "above" or "below"
-            "price": target_price,
-            "message": message,
-            "triggered": False,
-            "created_at": datetime.now()
-        })
-
-    def check_alerts(self, symbol, current_price):
-        if symbol not in self.alerts:
-            return []
-
-        triggered_alerts = []
-        for alert in self.alerts[symbol]:
-            if alert["triggered"]:
-                continue
-            if alert["condition"] == "above" and current_price >= alert["price"]:
-                alert["triggered"] = True
-                triggered_alerts.append(alert["message"])
-            elif alert["condition"] == "below" and current_price <= alert["price"]:
-                alert["triggered"] = True
-                triggered_alerts.append(alert["message"])
-
-        # Remove triggered alerts
-        self.alerts[symbol] = [a for a in self.alerts[symbol] if not a["triggered"]]
-        return triggered_alerts
-
-    def get_active_alerts(self, symbol=None):
-        if symbol:
-            return self.alerts.get(symbol, [])
-        return self.alerts
-
-# Initialize alert system
-alert_system = AlertSystem()
+    html_template = f"""
+    <div id="{container_id}"></div>
+    <script src="https://s3.tradingview.com/tv.js"></script>
+    <script>
+    const data = {json.dumps(js_data)};
+    new TradingView.widget({{
+        "container_id": "{container_id}",
+        "autosize": true,
+        "symbol": "{symbol}",
+        "interval": "D",
+        "timezone": "Etc/UTC",
+        "theme": "light",
+        "style": {0 if chart_type=="Candlestick" else 1},
+        "withdateranges": true,
+        "hide_side_toolbar": false,
+        "allow_symbol_change": true,
+        "details": true,
+        "studies": [],
+        "datafeed": {{
+            onReady: cb => cb({{supported_resolutions: ["1","5","15","60","240","D","W","M"]}}),
+            searchSymbols: (userInput, exchange, symbolType, onResultReadyCallback) => {},
+            resolveSymbol: (symbolName, onSymbolResolvedCallback, onResolveErrorCallback) => {{
+                onSymbolResolvedCallback({{
+                    name: symbolName,
+                    ticker: symbolName,
+                    type: "stock",
+                    session: "24x7",
+                    timezone: "Etc/UTC",
+                    minmov: 1,
+                    pricescale: 100,
+                    has_intraday: true,
+                    intraday_multipliers: ["1","5","15","60","240"],
+                    supported_resolution: ["1","5","15","60","240","D","W","M"]
+                }});
+            }},
+            getBars: (symbolInfo, resolution, periodParams, onHistoryCallback, onErrorCallback) => {{
+                onHistoryCallback(data, {{}}); 
+            }},
+            subscribeBars: () => {{}},
+            unsubscribeBars: () => {{}}
+        }},
+    }});
+    </script>
+    """
+    return html_template
 
 # ==============================
-# Streamlit Dashboard Rendering
+# Sidebar & Asset Selection
+# ==============================
+def sidebar_controls():
+    st.sidebar.header("Market Settings")
+
+    selected_category = st.sidebar.selectbox("Market Category", list(MARKETS.keys()))
+    symbols = MARKETS[selected_category]
+    selected_symbol = st.sidebar.selectbox("Symbol", symbols)
+
+    selected_timeframe = st.sidebar.selectbox("Timeframe", list(TIMEFRAMES.keys()))
+    selected_chart_type = st.sidebar.selectbox("Chart Type", CHART_TYPES)
+
+    days_lookback = st.sidebar.slider("History (days)", 7, 90, 30)
+    refresh_minutes = st.sidebar.number_input("Update Frequency (min)", 1, 360, 60)
+    return selected_category, selected_symbol, selected_timeframe, selected_chart_type, days_lookback, refresh_minutes
+
+    # ==============================
+# Main Dashboard Rendering
 # ==============================
 def build_dashboard():
     st.title("Market Monitor Dashboard")
 
+    # Sidebar selections
+    category, symbol, timeframe, chart_type, days_lookback, refresh_minutes = sidebar_controls()
+    refresh_seconds = refresh_minutes * 60
+
     # Initialize session state
     if 'last_update_time' not in st.session_state:
         st.session_state.last_update_time = datetime.now() - timedelta(minutes=10)
-    if 'selected_category' not in st.session_state:
-        st.session_state.selected_category = list(MARKETS.keys())[0]
-    if 'selected_symbol' not in st.session_state:
-        st.session_state.selected_symbol = MARKETS[st.session_state.selected_category][0]
-    if 'selected_timeframe' not in st.session_state:
-        st.session_state.selected_timeframe = "1d"
-    if 'selected_chart_type' not in st.session_state:
-        st.session_state.selected_chart_type = "Candlestick"
 
-    # Sidebar for settings
-    with st.sidebar:
-        st.header("Settings")
-        col1, col2 = st.columns(2)
+    # Auto-refresh
+    st_autorefresh(interval=refresh_seconds * 1000, key="data_refresh")
 
-        # Market Category
-        with col1:
-            selected_category = st.selectbox(
-                "Market Category",
-                list(MARKETS.keys()),
-                index=list(MARKETS.keys()).index(st.session_state.selected_category)
-            )
-            if selected_category != st.session_state.selected_category:
-                st.session_state.selected_category = selected_category
-                st.session_state.selected_symbol = MARKETS[selected_category][0]
-
-        # Symbol Selector
-        with col2:
-            available_symbols = MARKETS[selected_category]
-            selected_symbol = st.selectbox(
-                "Symbol",
-                available_symbols,
-                index=available_symbols.index(st.session_state.selected_symbol)
-            )
-            if selected_symbol != st.session_state.selected_symbol:
-                st.session_state.selected_symbol = selected_symbol
-
-        # Chart Settings
-        st.subheader("Chart Settings")
-        col3, col4 = st.columns(2)
-        with col3:
-            selected_timeframe = st.selectbox(
-                "Timeframe",
-                list(TIMEFRAMES.keys()),
-                index=list(TIMEFRAMES.keys()).index(st.session_state.selected_timeframe)
-            )
-            if selected_timeframe != st.session_state.selected_timeframe:
-                st.session_state.selected_timeframe = selected_timeframe
-
-        with col4:
-            selected_chart_type = st.selectbox(
-                "Chart Type",
-                CHART_TYPES,
-                index=CHART_TYPES.index(st.session_state.selected_chart_type)
-            )
-            if selected_chart_type != st.session_state.selected_chart_type:
-                st.session_state.selected_chart_type = selected_chart_type
-
-        # History range and refresh
-        days_lookback = st.slider("Days of History", 7, 90, 30)
-        use_real_api = st.checkbox("Use Real API (if API Key provided)", value=True)
-        refresh_minutes = st.number_input("Update Frequency (minutes)", 1, 360, 60)
-        refresh_seconds = refresh_minutes * 60
-
-        # Manual refresh
-        if st.button("Refresh Data Now"):
-            update_live_prices([selected_symbol], use_real_api)
-            st.session_state.last_update_time = datetime.now()
-            st.success(f"Data updated at {st.session_state.last_update_time.strftime('%H:%M:%S')}")
-
-        # Alert creation
-        current_data = cache.get_live(selected_symbol)
-        current_price = current_data["price"] if current_data else 100
-
-        alert_price = st.number_input("Alert Price", value=current_price, step=0.01)
-        alert_condition = st.radio("Condition", ["above", "below"])
-        alert_message = st.text_input("Alert Message", value=f"{selected_symbol} {alert_condition} {alert_price}")
-
-        if st.button("Add Alert"):
-            alert_system.add_alert(selected_symbol, alert_condition, alert_price, alert_message)
-            st.success(f"Alert added for {selected_symbol}")
-
-    # Update live prices if refresh needed
+    # Update live prices if needed
     time_since_update = (datetime.now() - st.session_state.last_update_time).total_seconds()
     if time_since_update > refresh_seconds:
-        update_live_prices([selected_symbol], use_real_api)
+        update_live_prices([symbol])
         st.session_state.last_update_time = datetime.now()
 
-    # Main chart area
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        st.header(f"{selected_symbol} Chart")
-        timeframe_api = TIMEFRAMES[selected_timeframe]
-        adjusted_days = min(days_lookback, 7 if selected_timeframe == "1h" else 30 if selected_timeframe == "4h" else days_lookback)
-        chart_data = prepare_chart_data(selected_symbol, timeframe_api, adjusted_days)
+    # Chart rendering
+    st.header(f"{symbol} Chart")
+    timeframe_api = TIMEFRAMES[timeframe]
+    adjusted_days = min(days_lookback, 7 if timeframe == "1h" else 30 if timeframe == "4h" else days_lookback)
+    chart_data = prepare_chart_data(symbol, timeframe_api, adjusted_days)
 
-        chart_container_id = f"chart_{selected_symbol}_{timeframe_api}_{selected_chart_type}"
-        chart_html = render_tradingview_chart(
-            selected_symbol,
-            chart_data,
-            chart_container_id,
-            chart_type=selected_chart_type,
-            height=500
-        )
-        st.components.v1.html(chart_html, height=520)
+    chart_html = render_tradingview_chart(symbol, chart_data, f"chart_{symbol}", chart_type=chart_type, height=500)
+    st.components.v1.html(chart_html, height=520)
 
-    with col2:
-        st.header("Market Overview")
-        live_data = {}
-        for symbol in MARKETS[selected_category]:
-            symbol_data = cache.get_live(symbol)
-            if symbol_data:
-                price = symbol_data["price"]
-                timestamp = symbol_data["timestamp"]
-            else:
-                price = 0
-                timestamp = int(time.time() * 1000)
+    # Live Market Overview
+    st.header("Market Overview")
+    live_data = {}
+    for s in MARKETS[category]:
+        symbol_data = cache.get_live(s)
+        price = symbol_data["price"] if symbol_data else 0
+        timestamp = symbol_data["timestamp"] if symbol_data else int(time.time() * 1000)
+        change = 0  # Can be enhanced with previous close
+        live_data[s] = {"price": price, "change": change, "timestamp": timestamp}
 
-            change = 0  # Real change requires previous close
+        # Alert check
+        if symbol_data:
+            triggered_alerts = alert_system.check_alerts(s, price)
+            for alert in triggered_alerts:
+                st.warning(f"ALERT: {alert}")
 
-            live_data[symbol] = {"price": price, "change": change, "timestamp": timestamp}
-            if symbol_data:
-                triggered_alerts = alert_system.check_alerts(symbol, price)
-                for alert in triggered_alerts:
-                    st.warning(f"ALERT: {alert}")
-
-        df = pd.DataFrame([
-            {"Symbol": s, "Price": round(d["price"], 4), "Change %": round(d["change"], 2),
-             "Updated": datetime.fromtimestamp(d["timestamp"] / 1000).strftime('%H:%M:%S')}
-            for s, d in live_data.items()
-        ])
-        st.dataframe(df, use_container_width=True)
+    df = pd.DataFrame([
+        {"Symbol": s, "Price": round(d["price"], 4), "Change %": round(d["change"], 2),
+         "Updated": datetime.fromtimestamp(d["timestamp"]/1000).strftime('%H:%M:%S')}
+        for s, d in live_data.items()
+    ])
+    st.dataframe(df, use_container_width=True)
 
 # ==============================
 # Main App Entry
