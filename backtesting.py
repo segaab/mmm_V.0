@@ -4,28 +4,16 @@ import numpy as np
 import datetime
 import time
 import logging
-import threading
 import matplotlib.pyplot as plt
-import seaborn as sns
 from sodapy import Socrata
 from yahooquery import Ticker
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import TensorDataset, DataLoader
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.model_selection import train_test_split
-
-# Set page config
-st.set_page_config(
-    page_title="Trading Strategy Backtester",
-    page_icon="📈",
-    layout="wide"
-)
 
 # --- Logging ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# --- Streamlit Page ---
+st.set_page_config(page_title="Trading Strategy Backtester", page_icon="📈", layout="wide")
 
 # --- COT API Client ---
 SODAPY_APP_TOKEN = "PP3ezxaUTiGforvvbBUGzwRx7"
@@ -76,7 +64,6 @@ def fetch_cot_data(market_name: str, max_attempts: int = 3) -> pd.DataFrame:
         time.sleep(2)
     logger.error(f"Failed fetching COT data for {market_name} after {max_attempts} attempts.")
     return pd.DataFrame()
-
 
 # --- Fetch Yahoo Price Data ---
 def fetch_yahooquery_data(ticker: str, start_date: str, end_date: str, max_attempts: int = 3) -> pd.DataFrame:
@@ -134,10 +121,19 @@ def generate_signals(df, buy_threshold=0.3, sell_threshold=0.7):
     df.loc[df["hg"] < buy_threshold, "signal"] = 1
     return df
 
+# --- Position Size Calculation ---
+def calculate_position_size(account_balance, risk_percent, leverage, stop_loss_pips, pip_value):
+    """
+    Position Size (lots) = Account Balance × Risk Percentage × Leverage / (Stop Loss × Pip Value)
+    """
+    if stop_loss_pips <= 0 or pip_value <= 0:
+        return 0
+    position_size = (account_balance * risk_percent * leverage) / (stop_loss_pips * pip_value)
+    return position_size
 
 # --- Execute Backtest ---
 def execute_backtest(signals_df: pd.DataFrame, starting_balance=10000, leverage=15,
-                     lot_size=1.0, exit_rr=2.0, rr_percent=0.1):
+                     lot_size=1.0, exit_rr=2.0, rr_percent=0.1, stop_loss_pips=50, pip_value=1):
     if signals_df.empty:
         return pd.DataFrame(), pd.DataFrame(), {}
 
@@ -151,14 +147,15 @@ def execute_backtest(signals_df: pd.DataFrame, starting_balance=10000, leverage=
         price_prev = signals_df.iloc[i-1]["close"]
 
         if signal != 0:
-            trade_capital = balance * rr_percent
-            trade_return = ((price_open - price_prev) / price_prev) * leverage * signal * lot_size
-            balance += trade_capital * trade_return
+            position_lots = calculate_position_size(balance, rr_percent, leverage, stop_loss_pips, pip_value) * lot_size
+            trade_return = ((price_open - price_prev) / price_prev) * leverage * signal * position_lots
+            balance += balance * rr_percent * trade_return
             rr_actual = trade_return / exit_rr if exit_rr != 0 else 0
             trades.append({
                 "date": signals_df.iloc[i]["date"],
                 "signal": signal,
                 "price": price_open,
+                "position_lots": position_lots,
                 "trade_return": trade_return,
                 "rr_actual": rr_actual,
                 "balance": balance
@@ -209,9 +206,11 @@ def main():
         sell_thresh = st.number_input("Sell Threshold", min_value=0.0, max_value=1.0, value=0.7, step=0.05)
 
         # Position parameters
-        lot_size = st.number_input("Lot Size", min_value=0.01, value=1.0, step=0.01)
+        lot_size = st.number_input("Lot Size Multiplier", min_value=0.01, value=1.0, step=0.01)
         exit_rr = st.number_input("Exit RR", min_value=0.1, value=2.0, step=0.1)
         rr_percent = st.number_input("RR % of Capital per Trade", min_value=0.01, max_value=1.0, value=0.1, step=0.01)
+        stop_loss_pips = st.number_input("Stop Loss (pips)", min_value=1, value=50, step=1)
+        pip_value = st.number_input("Pip Value", min_value=0.01, value=1.0, step=0.01)
         starting_balance = st.number_input("Starting Balance", min_value=1000, value=10000, step=1000)
         leverage = st.number_input("Leverage", min_value=1, value=15, step=1)
 
@@ -229,7 +228,9 @@ def main():
                                                      leverage=leverage,
                                                      lot_size=lot_size,
                                                      exit_rr=exit_rr,
-                                                     rr_percent=rr_percent)
+                                                     rr_percent=rr_percent,
+                                                     stop_loss_pips=stop_loss_pips,
+                                                     pip_value=pip_value)
 
     # Display metrics
     st.subheader("Backtest Metrics")
