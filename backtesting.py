@@ -1,4 +1,3 @@
-# ===== Chunk 1/3 =====
 import os
 import logging
 import time
@@ -71,7 +70,6 @@ def fetch_cot_data(market_name: str, max_attempts: int = 3) -> pd.DataFrame:
                 df = pd.DataFrame.from_records(results)
                 df["report_date"] = pd.to_datetime(df["report_date_as_yyyy_mm_dd"], errors="coerce")
                 df["open_interest_all"] = pd.to_numeric(df.get("open_interest_all", pd.Series()), errors="coerce")
-                # derive nets safely
                 try:
                     df["commercial_net"] = pd.to_numeric(df.get("commercial_long_all", 0), errors="coerce") - pd.to_numeric(df.get("commercial_short_all", 0), errors="coerce")
                     df["non_commercial_net"] = pd.to_numeric(df.get("non_commercial_long_all", 0), errors="coerce") - pd.to_numeric(df.get("non_commercial_short_all", 0), errors="coerce")
@@ -100,7 +98,6 @@ def fetch_price_data_yahoo(ticker: str, start_date: str, end_date: str, max_atte
             if hist is None or (isinstance(hist, pd.DataFrame) and hist.empty):
                 logger.warning("No price data for %s", ticker)
                 return pd.DataFrame()
-            # if MultiIndex (ticker, date), select ticker
             if isinstance(hist.index, pd.MultiIndex):
                 try:
                     hist = hist.loc[ticker]
@@ -120,9 +117,6 @@ def fetch_price_data_yahoo(ticker: str, start_date: str, end_date: str, max_atte
     logger.error("Failed fetching Yahoo data for %s after %d attempts.", ticker, max_attempts)
     return pd.DataFrame()
 
-# ===== End of Chunk 1/3 =====
-
-# ===== Chunk 2/3 =====
 
 # ------------------------------
 # Processing helpers
@@ -163,8 +157,8 @@ def merge_cot_price(cot_df: pd.DataFrame, price_df: pd.DataFrame) -> pd.DataFram
     merged["non_commercial_net"] = merged["non_commercial_net"].ffill()
     return merged
 
-# --- Price extension bands / price-based features ---
 def calculate_price_bands(price_df: pd.DataFrame, lookback: int = 60) -> pd.DataFrame:
+    """Calculate upper, lower, mid bands and extension for price."""
     if price_df is None or price_df.empty:
         return price_df
     df = price_df.copy()
@@ -179,8 +173,8 @@ def calculate_price_bands(price_df: pd.DataFrame, lookback: int = 60) -> pd.Data
     df["extension"] = ((df[close_col] - df["mid_band"]) / (df["range"] / 2 + 1e-9)).fillna(0.0)
     return df
 
-# --- Health gauge calculation ---
 def calculate_health_gauge(cot_df: pd.DataFrame, price_df: pd.DataFrame) -> float:
+    """Calculate a combined health score based on COT, price, and volume analytics."""
     if cot_df is None or cot_df.empty or price_df is None or price_df.empty:
         return float("nan")
     price_df = price_df.copy()
@@ -192,11 +186,7 @@ def calculate_health_gauge(cot_df: pd.DataFrame, price_df: pd.DataFrame) -> floa
     # Open interest score (25%)
     try:
         oi_series = price_df["open_interest_all"].dropna()
-        if oi_series.empty:
-            oi_score = 0.0
-        else:
-            oi_norm = (oi_series - oi_series.min()) / (oi_series.max() - oi_series.min() + 1e-9)
-            oi_score = float(oi_norm.iloc[-1])
+        oi_score = float((oi_series.iloc[-1] - oi_series.min()) / (oi_series.max() - oi_series.min() + 1e-9)) if not oi_series.empty else 0.0
     except Exception:
         oi_score = 0.0
 
@@ -274,6 +264,7 @@ def fetch_batch(batch_assets: List[Tuple[str, str]], start_date: pd.Timestamp, e
                 price_results[cot_name] = pd.DataFrame()
 
 def fetch_all_data(assets_dict: Dict[str, str], start_date: pd.Timestamp, end_date: pd.Timestamp, batch_size: int = 5) -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]:
+    """Fetch all assets in batches with threading."""
     cot_results: Dict[str, pd.DataFrame] = {}
     price_results: Dict[str, pd.DataFrame] = {}
     lock = threading.Lock()
@@ -292,20 +283,15 @@ def fetch_all_data(assets_dict: Dict[str, str], start_date: pd.Timestamp, end_da
 
     return cot_results, price_results
 
-# ===== End of Chunk 2/3 =====
-
-# ===== Chunk 3/3 =====
-
 # ------------------------------
 # Signal generation
 # ------------------------------
 
-def generate_signals(price_df: pd.DataFrame, buy_threshold: float = 7.0, sell_threshold: float = 3.0, rvol_threshold: float = 1.5) -> pd.DataFrame:
+def generate_signals(price_df: pd.DataFrame, buy_threshold: float, sell_threshold: float, rvol_threshold: float = 1.5) -> pd.DataFrame:
     """Generate buy/sell signals based on health gauge, RVOL, and extension."""
     if price_df is None or price_df.empty:
         return pd.DataFrame()
     df = price_df.copy()
-
     if "health_score" not in df.columns:
         df["health_score"] = 5.0
 
@@ -369,10 +355,8 @@ def train_exit_model(df: pd.DataFrame, epochs: int = 50, batch_size: int = 32, l
     if df.empty:
         raise ValueError("No data after computing future returns")
 
-    feature_cols = [
-        "returns", "log_returns", "rolling_mean_5", "rolling_mean_20",
-        "rolling_std_5", "rolling_std_20", "momentum_5", "momentum_20"
-    ]
+    feature_cols = ["returns", "log_returns", "rolling_mean_5", "rolling_mean_20",
+                    "rolling_std_5", "rolling_std_20", "momentum_5", "momentum_20"]
     for c in ["commercial_net", "non_commercial_net", "comm_net_change", "non_comm_net_change", "health_score", "extension"]:
         if c in df.columns:
             feature_cols.append(c)
@@ -411,10 +395,10 @@ def train_exit_model(df: pd.DataFrame, epochs: int = 50, batch_size: int = 32, l
     return model, scaler_X, scaler_y
 
 # ------------------------------
-# Backtesting
+# Backtesting with leverage & R:R
 # ------------------------------
 
-def backtest_signals(price_df: pd.DataFrame, signals_df: pd.DataFrame, initial_capital: float = 100000):
+def backtest_signals(price_df: pd.DataFrame, signals_df: pd.DataFrame, starting_balance: float, leverage: float, lot_size: int):
     df = price_df.copy()
     df = pd.merge(df, signals_df[["date", "buy_signal", "sell_signal", "strong_buy", "strong_sell"]], on="date", how="left")
     df.fillna(False, inplace=True)
@@ -428,29 +412,45 @@ def backtest_signals(price_df: pd.DataFrame, signals_df: pd.DataFrame, initial_c
         else:
             df.loc[i, "position"] = df.loc[i - 1, "position"]
 
-    df["strategy_returns"] = df["returns"] * df["position"].shift(1)
-    df["capital"] = initial_capital * (1 + df["strategy_returns"].cumsum())
-    return df
+    df["strategy_returns"] = df["returns"] * df["position"].shift(1) * leverage * lot_size
+    df["capital"] = starting_balance * (1 + df["strategy_returns"].cumsum())
 
-def plot_backtest(df: pd.DataFrame, asset_name: str):
-    plt.figure(figsize=(12,6))
-    plt.plot(df["date"], df["capital"], label="Strategy Capital")
-    plt.plot(df["date"], (1 + df["returns"].cumsum()) * df["capital"].iloc[0], label="Buy & Hold")
-    plt.title(f"Backtest: {asset_name}")
-    plt.xlabel("Date")
-    plt.ylabel("Capital")
-    plt.legend()
-    plt.grid(True)
-    plt.show()
+    # Risk/Reward tracking
+    df["rr_ratio"] = np.nan
+    max_rr = 0
+    achieved_rr = 0
+    for i in range(len(df)):
+        if df.loc[i, "position"] != 0:
+            entry_price = df["close"].iloc[i]
+            potential_exit = df["close"].iloc[i:]  # simplistic future price
+            if df.loc[i, "position"] == 1:
+                rr = (potential_exit.max() - entry_price) / (entry_price - potential_exit.min() + 1e-9)
+            else:
+                rr = (entry_price - potential_exit.min()) / (potential_exit.max() - entry_price + 1e-9)
+            df.at[i, "rr_ratio"] = rr
+            if rr > max_rr:
+                max_rr = rr
+            if rr > achieved_rr:
+                achieved_rr = rr
+
+    return df, max_rr, achieved_rr
 
 # ------------------------------
-# Main function
+# Streamlit Main Function
 # ------------------------------
 
 def main():
     st.title("COT + Price Backtester")
+
     start_date = st.sidebar.date_input("Start Date", datetime(2023, 1, 1))
     end_date = st.sidebar.date_input("End Date", datetime.today())
+
+    buy_threshold = st.sidebar.slider("Buy Threshold", min_value=1.0, max_value=10.0, value=7.0, step=0.5)
+    sell_threshold = st.sidebar.slider("Sell Threshold", min_value=1.0, max_value=10.0, value=3.0, step=0.5)
+    starting_balance = st.sidebar.number_input("Starting Balance", value=100000.0, step=1000.0)
+    leverage = st.sidebar.number_input("Leverage", value=1.0, step=0.1)
+    lot_size = st.sidebar.number_input("Lot Size", value=1, step=1)
+    exit_days = st.sidebar.slider("Exit Horizon (Days)", min_value=1, max_value=20, value=5)
 
     selected_assets = st.sidebar.multiselect("Select Assets", list(assets.keys()), default=list(assets.keys())[:3])
 
@@ -466,15 +466,6 @@ def main():
             price_df = price_results.get(name)
             if price_df is None or price_df.empty:
                 st.warning(f"No price data for {name}")
-                continue
-
-            signals_df = generate_signals(price_df)
-            backtest_df = backtest_signals(price_df, signals_df)
-            st.subheader(f"{name} Backtest Results")
-            st.line_chart(backtest_df[["capital"]])
-            st.write(backtest_df.tail(10))
 
 if __name__ == "__main__":
     main()
-
-# ===== End of Chunk 3/3 =====
