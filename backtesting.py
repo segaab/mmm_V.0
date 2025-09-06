@@ -1,3 +1,4 @@
+# ------------------- CHUNK 1/4 -------------------
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -9,12 +10,6 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sodapy import Socrata
 from yahooquery import Ticker
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import TensorDataset, DataLoader
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.model_selection import train_test_split
 
 # Set page config
 st.set_page_config(
@@ -51,6 +46,7 @@ assets = {
     "PALLADIUM - NEW YORK MERCANTILE EXCHANGE": "PA=F",
 }
 
+# ------------------- CHUNK 2/4 -------------------
 # --- Fetch COT Data ---
 def fetch_cot_data(market_name: str, max_attempts: int = 3) -> pd.DataFrame:
     logger.info(f"Fetching COT data for {market_name}")
@@ -85,96 +81,34 @@ def fetch_cot_data(market_name: str, max_attempts: int = 3) -> pd.DataFrame:
     logger.error(f"Failed fetching COT data for {market_name} after {max_attempts} attempts.")
     return pd.DataFrame()
 
-# --- Fetch Yahoo Price Data ---
-def fetch_yahooquery_data(ticker: str, start_date: str, end_date: str, max_attempts: int = 3) -> pd.DataFrame:
-    logger.info(f"Fetching Yahoo data for {ticker} from {start_date} to {end_date}")
-    attempt = 0
-    while attempt < max_attempts:
-        try:
-            t = Ticker(ticker)
-            hist = t.history(start=start_date, end=end_date, interval="1d")
-            if hist.empty:
-                logger.warning(f"No price data for {ticker}")
-                return pd.DataFrame()
-            if isinstance(hist.index, pd.MultiIndex):
-                hist = hist.loc[ticker]
-            hist = hist.reset_index()
-            hist["date"] = pd.to_datetime(hist["date"])
-            return hist.sort_values("date")
-        except Exception as e:
-            logger.error(f"Error fetching Yahoo data for {ticker}: {e}")
-        attempt += 1
-        time.sleep(2)
-    logger.error(f"Failed fetching Yahoo data for {ticker} after {max_attempts} attempts.")
-    return pd.DataFrame()
-
-# --- Calculate Relative Volume ---
-def calculate_rvol(df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
-    vol_col = "volume" if "volume" in df.columns else ("Volume" if "Volume" in df.columns else None)
-    if vol_col is None:
-        df["rvol"] = np.nan
-        return df
-    rolling_avg = df[vol_col].rolling(window).mean()
-    df["rvol"] = df[vol_col] / rolling_avg
-    return df
-
-# --- Merge COT and Price Data ---
-def merge_cot_price(cot_df: pd.DataFrame, price_df: pd.DataFrame) -> pd.DataFrame:
-    if cot_df.empty or price_df.empty:
+# --- Fetch Price Data ---
+def fetch_price_data(ticker: str, start_date: datetime.date, end_date: datetime.date) -> pd.DataFrame:
+    logger.info(f"Fetching price data for {ticker}")
+    try:
+        t = Ticker(ticker)
+        df = t.history(start=start_date, end=end_date)
+        if df.empty:
+            return pd.DataFrame()
+        df = df.reset_index()
+        df.rename(columns={"date": "date", "close": "close"}, inplace=True)
+        return df[['date', 'close']]
+    except Exception as e:
+        logger.error(f"Error fetching price data for {ticker}: {e}")
         return pd.DataFrame()
-    cot_df_small = cot_df[["report_date", "open_interest_all", "commercial_net", "non_commercial_net"]].copy()
-    cot_df_small.rename(columns={"report_date": "date"}, inplace=True)
-    cot_df_small["date"] = pd.to_datetime(cot_df_small["date"])
-    price_df = price_df.copy()
-    price_df["date"] = pd.to_datetime(price_df["date"])
-    price_df = price_df.sort_values("date")
-    cot_df_small = cot_df_small.sort_values("date")
-    full_dates = pd.DataFrame({"date": pd.date_range(price_df["date"].min(), price_df["date"].max())})
-    cot_df_filled = pd.merge_asof(full_dates, cot_df_small, on="date", direction="backward")
-    merged = pd.merge(price_df, cot_df_filled[["date", "open_interest_all", "commercial_net", "non_commercial_net"]], on="date", how="left")
-    merged["open_interest_all"] = merged["open_interest_all"].ffill()
-    merged["commercial_net"] = merged["commercial_net"].ffill()
-    merged["non_commercial_net"] = merged["non_commercial_net"].ffill()
-    return merged
+
+# --- Batch Fetching for Multithreading ---
+def fetch_batch(batch_items, start_date, end_date, cot_results, price_results, lock):
+    for asset_name, ticker in batch_items:
+        cot_df = fetch_cot_data(asset_name)
+        price_df = fetch_price_data(ticker, start_date, end_date)
+        with lock:
+            cot_results[asset_name] = cot_df
+            price_results[asset_name] = price_df
 
 
-# --- Threaded Batch Fetch ---
-def fetch_batch(batch_assets, start_date, end_date, cot_results, price_results, lock):
-    for cot_name, ticker in batch_assets:
-        try:
-            cot_df = fetch_cot_data(cot_name)
-            if cot_df.empty:
-                with lock:
-                    cot_results[cot_name] = pd.DataFrame()
-                    price_results[cot_name] = pd.DataFrame()
-                continue
-            cot_start = cot_df["report_date"].min().date()
-            cot_end = cot_df["report_date"].max().date()
-            adj_start = max(start_date, cot_start)
-            adj_end = min(end_date, cot_end + datetime.timedelta(days=7))
-            price_df = fetch_yahooquery_data(ticker, adj_start.isoformat(), adj_end.isoformat())
-            if price_df.empty:
-                with lock:
-                    cot_results[cot_name] = cot_df
-                    price_results[cot_name] = pd.DataFrame()
-                continue
-            price_df = calculate_rvol(price_df)
-            merged_df = merge_cot_price(cot_df, price_df)
-            with lock:
-                cot_results[cot_name] = cot_df
-                price_results[cot_name] = merged_df
-        except Exception as e:
-            logger.error(f"Error loading data for {cot_name}: {e}")
-            with lock:
-                cot_results[cot_name] = pd.DataFrame()
-                price_results[cot_name] = pd.DataFrame()
-
-
+# ------------------- CHUNK 3/4 -------------------
 # --- Fetch All Data ---
 def fetch_all_data(assets_dict, start_date, end_date, batch_size: int = 5):
-    """
-    Fetch COT and price data for all assets in batches using multithreading.
-    """
     cot_results = {}
     price_results = {}
     lock = threading.Lock()
@@ -198,9 +132,6 @@ def fetch_all_data(assets_dict, start_date, end_date, batch_size: int = 5):
 
 # --- Process Signals ---
 def process_signals(cot_data, price_data, strategy_params):
-    """
-    Generate trading signals based on COT net positions and optional strategy parameters.
-    """
     signals_list = []
 
     for asset, df in cot_data.items():
@@ -210,7 +141,6 @@ def process_signals(cot_data, price_data, strategy_params):
         price_df = price_data[asset]
         merged_df = pd.merge(df, price_df, on="date", how="inner")
 
-        # Example strategy: long if non-commercial net position > threshold, short if < -threshold
         net_position = merged_df['non_commercial_long'] - merged_df['non_commercial_short']
         threshold = strategy_params.get('net_position_threshold', 10000)
 
@@ -226,9 +156,6 @@ def process_signals(cot_data, price_data, strategy_params):
 
 # --- Execute Backtest ---
 def execute_backtest(signals_df, starting_balance=10000, leverage=15, position_size='medium'):
-    """
-    Simple backtester using signals, returns equity curve, trade log, and summary metrics.
-    """
     if signals_df.empty:
         return pd.DataFrame(), pd.DataFrame(), {}
 
@@ -243,10 +170,9 @@ def execute_backtest(signals_df, starting_balance=10000, leverage=15, position_s
     for asset, group in grouped:
         group = group.sort_values('date')
         for _, row in group.iterrows():
-            price = row.get('close', 100)  # fallback price
+            price = row.get('close', 100)
             signal = row['signal']
             position = balance * pos_fraction * leverage * signal
-            # For demonstration, simulate PnL with random noise (replace with real price changes)
             pnl = position * (np.random.randn() * 0.01)
             balance += pnl
 
@@ -255,10 +181,8 @@ def execute_backtest(signals_df, starting_balance=10000, leverage=15, position_s
 
     return pd.DataFrame(equity_curve), pd.DataFrame(trades), {'final_balance': balance}
 
+# ------------------- CHUNK 4/4 -------------------
 # --- Streamlit Backtester UI ---
-import streamlit as st
-import datetime
-
 def main():
     st.title("Health Gauge Trading Strategy Backtester")
 
@@ -266,14 +190,12 @@ def main():
     with st.sidebar:
         st.header("Backtest Parameters")
 
-        # Asset selection
         selected_asset = st.selectbox(
             "Select Asset",
-            list(COTAssets.keys()),  # COTAssets assumed to be defined elsewhere
+            list(assets.keys()),
             index=0
         )
 
-        # Time period selection
         years_back = st.slider(
             "Years to Backtest",
             min_value=1,
@@ -284,7 +206,6 @@ def main():
         start_date = datetime.date.today() - datetime.timedelta(days=365 * years_back)
         end_date = datetime.date.today()
 
-        # Strategy parameters
         net_pos_threshold = st.number_input(
             "Non-Commercial Net Position Threshold",
             value=10000,
@@ -306,21 +227,18 @@ def main():
     if run_button:
         st.info("Fetching data and running backtest, please wait...")
 
-        # Fetch all data
         cot_data, price_data = fetch_all_data(
-            {selected_asset: COTAssets[selected_asset]},
+            {selected_asset: assets[selected_asset]},
             start_date=start_date,
             end_date=end_date
         )
 
-        # Process signals
         signals_df = process_signals(
             cot_data,
             price_data,
             strategy_params={'net_position_threshold': net_pos_threshold}
         )
 
-        # Execute backtest
         equity_curve_df, trades_df, summary = execute_backtest(
             signals_df,
             starting_balance=10000,
@@ -328,7 +246,6 @@ def main():
             position_size=position_size
         )
 
-        # Display results
         st.subheader("Equity Curve")
         if not equity_curve_df.empty:
             st.line_chart(equity_curve_df.set_index('date')['balance'])
