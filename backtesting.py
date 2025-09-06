@@ -247,7 +247,7 @@ def calculate_health_gauge(cot_df: pd.DataFrame, price_df: pd.DataFrame) -> floa
 # --- Calculate Health Gauge Time Series ---
 def calculate_health_gauge_series(cot_df, price_df):
     if cot_df.empty or price_df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame({'date': [], 'health_gauge': []})
     
     health_scores = []
     dates = []
@@ -580,7 +580,7 @@ def prepare_nn_data(health_df, price_df, lookback=20):
     # No explicit Y - we'll use backtest performance as feedback
     return X_scaled, data['date'].values
 
-# --- Train NN with Reinforcement Learning ---
+# --- Train NN with Reinforcement Learning --- (FIXED)
 def train_nn(X, dates, cot_df, price_df, epochs=20, lr=0.001, batch_size=32):
     if X is None or len(X) == 0:
         return None, None, None
@@ -598,6 +598,9 @@ def train_nn(X, dates, cot_df, price_df, epochs=20, lr=0.001, batch_size=32):
     progress_bar = st.progress(0)
     status_text = st.empty()
     
+    # First calculate the health gauge series once (FIX)
+    health_gauge_series = calculate_health_gauge_series(cot_df, price_df)
+    
     for epoch in range(epochs):
         status_text.text(f"Training epoch {epoch+1}/{epochs}")
         progress_bar.progress((epoch + 1) / epochs)
@@ -607,8 +610,8 @@ def train_nn(X, dates, cot_df, price_df, epochs=20, lr=0.001, batch_size=32):
         buy_threshold = 5.0 + outputs[:, 0].mean().item() * 5.0  # Scale to 5-10
         sell_threshold = outputs[:, 1].mean().item() * 5.0  # Scale to 0-5
         
-        # Create health gauge series
-        health_df = pd.DataFrame({'date': dates, 'health_gauge': calculate_health_gauge_series(cot_df, price_df)['health_gauge']})
+        # Create health gauge dataframe directly (FIX)
+        health_df = health_gauge_series.copy()
         
         # Calculate price bands
         price_with_bands = calculate_price_bands(price_df)
@@ -645,184 +648,91 @@ def train_nn(X, dates, cot_df, price_df, epochs=20, lr=0.001, batch_size=32):
     
     return model, best_buy_threshold, best_sell_threshold
 
-# --- Streamlit Dashboard Layout ---
+
 def main():
     st.title("Health Gauge Trading Strategy Backtester")
     
+    # Sidebar for parameters
     with st.sidebar:
         st.header("Backtest Parameters")
         
-        # Asset selection
-        selected_asset = st.selectbox(
-            "Select Asset",
-            list(assets.keys()),
-            index=0
-        )
+        selected_asset = st.selectbox("Select Asset", list(assets.keys()), index=0)
+        years_back = st.slider("Years to Backtest", 1, 10, 5)
         
-        # Time period
-        years_back = st.slider(
-            "Years to Backtest",
-            min_value=1,
-            max_value=10,
-            value=5,
-            step=1
-        )
+        buy_threshold = st.slider("Buy Threshold (Health Gauge ≥)", 5.0, 10.0, 7.0, 0.1)
+        sell_threshold = st.slider("Sell Threshold (Health Gauge ≤)", 0.0, 5.0, 3.0, 0.1)
         
-        # Entry thresholds
-        buy_threshold = st.slider(
-            "Buy Threshold (Health Gauge ≥)",
-            min_value=5.0,
-            max_value=10.0,
-            value=7.0,
-            step=0.1
-        )
+        starting_balance = st.number_input("Starting Balance ($)", 1000, 1000000, 10000, 1000)
+        leverage = st.slider("Leverage", 1, 30, 15)
+        position_size = st.select_slider("Position Size", options=["small", "medium", "large", "heavy"], value="medium")
         
-        sell_threshold = st.slider(
-            "Sell Threshold (Health Gauge ≤)",
-            min_value=0.0,
-            max_value=5.0,
-            value=3.0,
-            step=0.1
-        )
-        
-        # Account settings
-        starting_balance = st.number_input(
-            "Starting Balance ($)",
-            min_value=1000,
-            max_value=1000000,
-            value=10000,
-            step=1000
-        )
-        
-        leverage = st.slider(
-            "Leverage",
-            min_value=1,
-            max_value=30,
-            value=15,
-            step=1
-        )
-        
-        position_size = st.select_slider(
-            "Position Size",
-            options=["small", "medium", "large", "heavy"],
-            value="medium"
-        )
-        
-        # Neural Network settings
         st.header("Neural Network Settings")
-        
         use_nn = st.checkbox("Use Neural Network Optimization", value=True)
+        epochs = st.slider("Training Epochs", 5, 100, 20, 5, disabled=not use_nn)
+        learning_rate = st.select_slider("Learning Rate", options=[0.0001, 0.0005, 0.001, 0.005, 0.01], value=0.001, disabled=not use_nn)
         
-        epochs = st.slider(
-            "Training Epochs",
-            min_value=5,
-            max_value=100,
-            value=20,
-            step=5,
-            disabled=not use_nn
-        )
-        
-        learning_rate = st.select_slider(
-            "Learning Rate",
-            options=[0.0001, 0.0005, 0.001, 0.005, 0.01],
-            value=0.001,
-            disabled=not use_nn
-        )
-        
-        # Run backtest button
         run_backtest = st.button("Run Backtest")
     
-    # Main content
     if run_backtest:
-        # Show loading message
         with st.spinner("Fetching data and running backtest..."):
-            # Calculate date range
             end_date = datetime.datetime.now().date()
-            start_date = end_date - datetime.timedelta(days=years_back*365)
+            start_date = end_date - datetime.timedelta(days=years_back * 365)
             
-            # Fetch data
-            cot_results, price_results = fetch_all_data(
-                {selected_asset: assets[selected_asset]}, 
-                start_date, 
-                end_date
-            )
-            
+            cot_results, price_results = fetch_all_data({selected_asset: assets[selected_asset]}, start_date, end_date)
             cot_df = cot_results.get(selected_asset, pd.DataFrame())
             price_df = price_results.get(selected_asset, pd.DataFrame())
             
             if cot_df.empty or price_df.empty:
-                st.error(f"Could not fetch data for {selected_asset}. Please try another asset.")
+                st.error(f"Could not fetch data for {selected_asset}.")
                 return
             
-            # Calculate health gauge series
             health_df = calculate_health_gauge_series(cot_df, price_df)
-            
-            # Calculate price bands
             price_with_bands = calculate_price_bands(price_df)
             
-            # Neural Network optimization
             if use_nn:
                 st.subheader("Neural Network Optimization")
-                
-                # Prepare data for NN
                 X, dates = prepare_nn_data(health_df, price_with_bands)
                 
                 if X is not None and len(X) > 0:
-                    # Train NN
-                    model, nn_buy_threshold, nn_sell_threshold = train_nn(
-                        X, dates, cot_df, price_df, epochs, learning_rate
-                    )
-                    
+                    model, nn_buy_threshold, nn_sell_threshold = train_nn(X, dates, cot_df, price_df, epochs, learning_rate)
                     if model is not None:
                         st.success("Neural network training completed!")
                         
                         col1, col2 = st.columns(2)
                         with col1:
                             st.metric("Original Buy Threshold", f"{buy_threshold:.1f}")
-                            st.metric("Neural Network Buy Threshold", f"{nn_buy_threshold:.1f}")
-                        
+                            st.metric("NN Buy Threshold", f"{nn_buy_threshold:.1f}")
                         with col2:
                             st.metric("Original Sell Threshold", f"{sell_threshold:.1f}")
-                            st.metric("Neural Network Sell Threshold", f"{nn_sell_threshold:.1f}")
+                            st.metric("NN Sell Threshold", f"{nn_sell_threshold:.1f}")
                         
-                        # Ask user if they want to use the optimized thresholds
                         use_optimized = st.checkbox("Use optimized thresholds for backtest", value=True)
-                        
                         if use_optimized:
                             buy_threshold = nn_buy_threshold
                             sell_threshold = nn_sell_threshold
                 else:
-                    st.warning("Not enough data for neural network training. Using original thresholds.")
+                    st.warning("Not enough data for NN training. Using original thresholds.")
             
-            # Generate signals
             signals = generate_signals(health_df, price_with_bands, buy_threshold, sell_threshold)
-            
-            # Execute backtest
-            trades_df, equity_curve, metrics = execute_backtest(
-                signals, starting_balance, leverage, position_size
-            )
+            trades_df, equity_curve, metrics = execute_backtest(signals, starting_balance, leverage, position_size)
             
             # Display results
             st.header("Backtest Results")
             
-            # Metrics
             col1, col2, col3, col4 = st.columns(4)
             with col1:
                 st.metric("Final Balance", f"${metrics['final_balance']:.2f}")
-                st.metric("Return on Investment", f"{metrics['roi']*100:.2f}%")
-            
+                st.metric("ROI", f"{metrics['roi']*100:.2f}%")
             with col2:
                 st.metric("Total Trades", metrics['total_trades'])
                 st.metric("Win Rate", f"{metrics['win_rate']*100:.1f}%")
-            
             with col3:
-                st.metric("Average R Multiple", f"{metrics['avg_r']:.2f}")
-                st.metric("Maximum R Multiple", f"{metrics['max_r']:.2f}")
-            
+                st.metric("Avg R Multiple", f"{metrics['avg_r']:.2f}")
+                st.metric("Max R Multiple", f"{metrics['max_r']:.2f}")
             with col4:
-                st.metric("Maximum Drawdown", f"{abs(metrics['max_drawdown']):.2f}%")
+                st.metric("Max Drawdown", f"{abs(metrics['max_drawdown']):.2f}%")
             
-            # Plots
+            # Equity Curve
             st.subheader("Equity Curve")
             if not equity_curve.empty:
                 fig, ax = plt.subplots(figsize=(10, 5))
@@ -834,54 +744,26 @@ def main():
             else:
                 st.warning("No equity curve data available.")
             
-            # Health Gauge and Signals
+            # Health Gauge & Signals
             st.subheader("Health Gauge and Trade Signals")
             if not health_df.empty and not signals.empty:
-                # Merge health gauge with signals
-                plot_data = pd.merge(health_df, signals[['date', 'buy_signal', 'sell_signal']], on='date', how='left')
-                plot_data['buy_signal'] = plot_data['buy_signal'].fillna(False)
-                plot_data['sell_signal'] = plot_data['sell_signal'].fillna(False)
-                
+                plot_data = pd.merge(health_df, signals[['date', 'buy_signal', 'sell_signal']], on='date', how='left').fillna(False)
                 close_col = "close" if "close" in signals.columns else "Close"
                 
                 fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
-                
-                # Health Gauge plot
                 ax1.plot(plot_data['date'], plot_data['health_gauge'], label='Health Gauge')
-                ax1.axhline(y=buy_threshold, color='g', linestyle='--', label=f'Buy Threshold ({buy_threshold:.1f})')
-                ax1.axhline(y=sell_threshold, color='r', linestyle='--', label=f'Sell Threshold ({sell_threshold:.1f})')
-                
-                # Add buy/sell markers
-                buy_points = plot_data[plot_data['buy_signal']]['date']
-                sell_points = plot_data[plot_data['sell_signal']]['date']
-                
-                if len(buy_points) > 0:
-                    buy_values = plot_data[plot_data['buy_signal']]['health_gauge']
-                    ax1.scatter(buy_points, buy_values, marker='^', color='g', s=100, label='Buy Signal')
-                
-                if len(sell_points) > 0:
-                    sell_values = plot_data[plot_data['sell_signal']]['health_gauge']
-                    ax1.scatter(sell_points, sell_values, marker='v', color='r', s=100, label='Sell Signal')
-                
+                ax1.axhline(buy_threshold, color='g', linestyle='--', label=f'Buy Threshold ({buy_threshold:.1f})')
+                ax1.axhline(sell_threshold, color='r', linestyle='--', label=f'Sell Threshold ({sell_threshold:.1f})')
+                ax1.scatter(plot_data.loc[plot_data['buy_signal'], 'date'], plot_data.loc[plot_data['buy_signal'], 'health_gauge'], marker='^', color='g', s=100, label='Buy Signal')
+                ax1.scatter(plot_data.loc[plot_data['sell_signal'], 'date'], plot_data.loc[plot_data['sell_signal'], 'health_gauge'], marker='v', color='r', s=100, label='Sell Signal')
                 ax1.set_ylabel('Health Gauge')
                 ax1.legend()
                 ax1.grid(True)
                 
-                # Price plot
                 merged_data = pd.merge(plot_data, signals[['date', close_col]], on='date', how='left')
                 ax2.plot(merged_data['date'], merged_data[close_col], label='Price')
-                
-                # Add buy/sell markers on price chart
-                if len(buy_points) > 0:
-                    buy_prices = merged_data.loc[merged_data['date'].isin(buy_points), close_col]
-                    buy_dates = merged_data.loc[merged_data['date'].isin(buy_points), 'date']
-                    ax2.scatter(buy_dates, buy_prices, marker='^', color='g', s=100)
-                
-                if len(sell_points) > 0:
-                    sell_prices = merged_data.loc[merged_data['date'].isin(sell_points), close_col]
-                    sell_dates = merged_data.loc[merged_data['date'].isin(sell_points), 'date']
-                    ax2.scatter(sell_dates, sell_prices, marker='v', color='r', s=100)
-                
+                ax2.scatter(merged_data.loc[merged_data['buy_signal'], 'date'], merged_data.loc[merged_data['buy_signal'], close_col], marker='^', color='g', s=100)
+                ax2.scatter(merged_data.loc[merged_data['sell_signal'], 'date'], merged_data.loc[merged_data['sell_signal'], close_col], marker='v', color='r', s=100)
                 ax2.set_xlabel('Date')
                 ax2.set_ylabel('Price')
                 ax2.grid(True)
@@ -894,30 +776,23 @@ def main():
             # Trade Analysis
             st.subheader("Trade Analysis")
             if not trades_df.empty:
-                # Filter to show only entries and exits
                 trade_summary = trades_df[trades_df['action'].str.contains('entry|exit')].copy()
-                
-                # Format the display
                 trade_summary['date'] = pd.to_datetime(trade_summary['date']).dt.strftime('%Y-%m-%d')
                 trade_summary['balance'] = trade_summary['balance'].map('${:,.2f}'.format)
                 trade_summary['r_multiple'] = trade_summary['r_multiple'].map('{:+.2f}R'.format)
-                
-                # Display in a more compact format
                 st.dataframe(trade_summary[['date', 'trade_id', 'action', 'price', 'balance', 'r_multiple', 'drawdown']], height=400)
                 
-                # R-Multiple Distribution
                 r_values = trades_df[trades_df['action'].str.contains('exit')]['r_multiple'].dropna()
                 if len(r_values) > 0:
                     st.subheader("R-Multiple Distribution")
                     fig, ax = plt.subplots(figsize=(10, 5))
                     sns.histplot(r_values, kde=True, ax=ax)
-                    ax.axvline(x=0, color='black', linestyle='--')
+                    ax.axvline(0, color='black', linestyle='--')
                     ax.set_xlabel('R-Multiple')
                     ax.set_ylabel('Frequency')
                     st.pyplot(fig)
             else:
-                st.warning("No trades were executed in this backtest.")
+                st.warning("No trades executed in this backtest.")
 
 if __name__ == "__main__":
     main()
-      
