@@ -1,9 +1,10 @@
+# ===== Chunk 1/3 =====
 import os
 import logging
 import time
 import threading
 from typing import Dict, Tuple, List
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 
 import streamlit as st
 import pandas as pd
@@ -29,7 +30,7 @@ logger = logging.getLogger(__name__)
 SODAPY_APP_TOKEN = "PP3ezxaUTiGforvvbBUGzwRx7"
 client = Socrata("publicreporting.cftc.gov", SODAPY_APP_TOKEN, timeout=60)
 
-# --- Assets Mapping ---
+# --- Asset Mapping ---
 assets = {
     "GOLD - COMMODITY EXCHANGE INC.": "GC=F",
     "SILVER - COMMODITY EXCHANGE INC.": "SI=F",
@@ -52,7 +53,6 @@ assets = {
 # ------------------------------
 # Data fetching helpers
 # ------------------------------
-
 def fetch_cot_data(market_name: str, max_attempts: int = 3) -> pd.DataFrame:
     logger.info("Fetching COT data for %s", market_name)
     where_clause = f'market_and_exchange_names="{market_name}"'
@@ -69,7 +69,6 @@ def fetch_cot_data(market_name: str, max_attempts: int = 3) -> pd.DataFrame:
                 df = pd.DataFrame.from_records(results)
                 df["report_date"] = pd.to_datetime(df["report_date_as_yyyy_mm_dd"], errors="coerce")
                 df["open_interest_all"] = pd.to_numeric(df.get("open_interest_all", pd.Series()), errors="coerce")
-                # derive nets safely
                 try:
                     df["commercial_net"] = pd.to_numeric(df.get("commercial_long_all", 0), errors="coerce") - pd.to_numeric(df.get("commercial_short_all", 0), errors="coerce")
                     df["non_commercial_net"] = pd.to_numeric(df.get("non_commercial_long_all", 0), errors="coerce") - pd.to_numeric(df.get("non_commercial_short_all", 0), errors="coerce")
@@ -97,7 +96,6 @@ def fetch_price_data_yahoo(ticker: str, start_date: str, end_date: str, max_atte
             if hist is None or (isinstance(hist, pd.DataFrame) and hist.empty):
                 logger.warning("No price data for %s", ticker)
                 return pd.DataFrame()
-            # if MultiIndex (ticker, date), select ticker
             if isinstance(hist.index, pd.MultiIndex):
                 try:
                     hist = hist.loc[ticker]
@@ -109,6 +107,8 @@ def fetch_price_data_yahoo(ticker: str, start_date: str, end_date: str, max_atte
             else:
                 hist.index = pd.to_datetime(hist.index)
                 hist = hist.reset_index().rename(columns={"index": "date"})
+            # Normalize column names
+            hist.columns = [c.lower() for c in hist.columns]
             return hist.sort_values("date").reset_index(drop=True)
         except Exception as e:
             logger.error("Error fetching Yahoo data for %s: %s", ticker, e)
@@ -123,6 +123,7 @@ def fetch_price_data_yahoo(ticker: str, start_date: str, end_date: str, max_atte
 # ------------------------------
 
 def calculate_rvol(df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
+    """Add rvol column to df (volume / rolling mean volume)."""
     if df is None or df.empty:
         return df
     df = df.copy()
@@ -135,20 +136,20 @@ def calculate_rvol(df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
     return df
 
 def calculate_atr(df: pd.DataFrame, lookback: int = 14) -> pd.Series:
-    if df is None or df.empty:
-        return pd.Series()
-    df = df.copy()
-    high = df["high"] if "high" in df.columns else df["High"]
-    low = df["low"] if "low" in df.columns else df["Low"]
-    close = df["close"] if "close" in df.columns else df["Close"]
-    df["tr1"] = high - low
-    df["tr2"] = (high - close.shift(1)).abs()
-    df["tr3"] = (low - close.shift(1)).abs()
-    tr = df[["tr1", "tr2", "tr3"]].max(axis=1)
+    """Calculate ATR for volatility."""
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs()
+    ], axis=1).max(axis=1)
     atr = tr.rolling(lookback, min_periods=1).mean()
     return atr
 
 def merge_cot_price(cot_df: pd.DataFrame, price_df: pd.DataFrame) -> pd.DataFrame:
+    """Merge weekly COT onto daily prices using merge_asof."""
     if cot_df is None or cot_df.empty or price_df is None or price_df.empty:
         return pd.DataFrame()
     cot_small = cot_df[["report_date", "open_interest_all", "commercial_net", "non_commercial_net"]].copy()
@@ -169,8 +170,24 @@ def merge_cot_price(cot_df: pd.DataFrame, price_df: pd.DataFrame) -> pd.DataFram
     merged["non_commercial_net"] = merged["non_commercial_net"].ffill()
     return merged
 
-# --- Health gauge calculation ---
+def calculate_price_bands(price_df: pd.DataFrame, lookback: int = 60) -> pd.DataFrame:
+    """Add upper, lower, mid bands, range, and extension metrics."""
+    if price_df is None or price_df.empty:
+        return price_df
+    df = price_df.copy()
+    close_col = "close"
+    high_col = "high"
+    low_col = "low"
+
+    df["upper_band"] = df[high_col].rolling(lookback, min_periods=1).max()
+    df["lower_band"] = df[low_col].rolling(lookback, min_periods=1).min()
+    df["mid_band"] = (df["upper_band"] + df["lower_band"]) / 2.0
+    df["range"] = df["upper_band"] - df["lower_band"]
+    df["extension"] = ((df[close_col] - df["mid_band"]) / (df["range"] / 2 + 1e-9)).fillna(0.0)
+    return df
+
 def calculate_health_gauge(cot_df: pd.DataFrame, price_df: pd.DataFrame) -> float:
+    """Compute composite health score combining open interest, COT, and price signals."""
     if cot_df is None or cot_df.empty or price_df is None or price_df.empty:
         return float("nan")
     price_df = price_df.copy()
@@ -200,14 +217,8 @@ def calculate_health_gauge(cot_df: pd.DataFrame, price_df: pd.DataFrame) -> floa
         noncomm["report_date"] = pd.to_datetime(noncomm["report_date"], errors="coerce")
         long_term = noncomm[noncomm["report_date"] >= one_year_ago]
 
-        st_score = 0.0 if short_term.empty else float(
-            (short_term["commercial_net"].iloc[-1] - short_term["commercial_net"].min()) /
-            (short_term["commercial_net"].max() - short_term["commercial_net"].min() + 1e-9)
-        )
-        lt_score = 0.0 if long_term.empty else float(
-            (long_term["non_commercial_net"].iloc[-1] - long_term["non_commercial_net"].min()) /
-            (long_term["non_commercial_net"].max() - long_term["non_commercial_net"].min() + 1e-9)
-        )
+        st_score = 0.0 if short_term.empty else float((short_term["commercial_net"].iloc[-1] - short_term["commercial_net"].min()) / (short_term["commercial_net"].max() - short_term["commercial_net"].min() + 1e-9))
+        lt_score = 0.0 if long_term.empty else float((long_term["non_commercial_net"].iloc[-1] - long_term["non_commercial_net"].min()) / (long_term["non_commercial_net"].max() - long_term["non_commercial_net"].min() + 1e-9))
 
         cot_analytics_score = 0.4 * st_score + 0.6 * lt_score
     except Exception:
@@ -219,22 +230,17 @@ def calculate_health_gauge(cot_df: pd.DataFrame, price_df: pd.DataFrame) -> floa
         if recent.empty or "rvol" not in recent.columns:
             pv_score = 0.0
         else:
-            close_col = "close" if "close" in recent.columns else ("Close" if "Close" in recent.columns else None)
-            vol_col = "volume" if "volume" in recent.columns else ("Volume" if "Volume" in recent.columns else None)
-            if close_col is None or vol_col is None:
+            recent["return"] = recent["close"].pct_change().fillna(0.0)
+            rvol_75 = recent["rvol"].quantile(0.75)
+            recent["vol_avg20"] = recent["volume"].rolling(20).mean()
+            recent["vol_spike"] = recent["volume"] > recent["vol_avg20"]
+            filt = recent[(recent["rvol"] >= rvol_75) & (recent["vol_spike"])]
+            if filt.empty:
                 pv_score = 0.0
             else:
-                recent["return"] = recent[close_col].pct_change().fillna(0.0)
-                rvol_75 = recent["rvol"].quantile(0.75)
-                recent["vol_avg20"] = recent[vol_col].rolling(20).mean()
-                recent["vol_spike"] = recent[vol_col] > recent["vol_avg20"]
-                filt = recent[(recent["rvol"] >= rvol_75) & (recent["vol_spike"])]
-                if filt.empty:
-                    pv_score = 0.0
-                else:
-                    last_ret = float(filt["return"].iloc[-1])
-                    bucket = 5 if last_ret >= 0.02 else 4 if last_ret >= 0.01 else 3 if last_ret >= -0.01 else 2 if last_ret >= -0.02 else 1
-                    pv_score = (bucket - 1) / 4.0
+                last_ret = float(filt["return"].iloc[-1])
+                bucket = 5 if last_ret >= 0.02 else 4 if last_ret >= 0.01 else 3 if last_ret >= -0.01 else 2 if last_ret >= -0.02 else 1
+                pv_score = (bucket - 1) / 4.0
     except Exception:
         pv_score = 0.0
 
@@ -242,125 +248,102 @@ def calculate_health_gauge(cot_df: pd.DataFrame, price_df: pd.DataFrame) -> floa
 
 
 # ------------------------------
-# Signal generation with ATR and RVol
+# Backtesting
 # ------------------------------
 
-def generate_signals(price_df: pd.DataFrame, buy_threshold: float = 7.0, sell_threshold: float = 3.0,
-                     rvol_threshold: float = 1.5, atr_lookback: int = 14, rvol_lookback: int = 20) -> pd.DataFrame:
-    if price_df is None or price_df.empty:
-        return pd.DataFrame()
-    df = price_df.copy()
+def backtest_signals(df: pd.DataFrame, signals: pd.DataFrame, initial_capital: float = 10000,
+                     leverage: float = 1.0, lot_size: float = 1.0, rr_per_trade: float = 0.02,
+                     max_rr: float = 5.0) -> tuple[pd.DataFrame, dict]:
+    """Run backtest with forced exit at max R:R."""
+    if df is None or df.empty or signals is None or signals.empty:
+        return pd.DataFrame(), {}
 
-    df = calculate_rvol(df, window=rvol_lookback)
-    df["atr"] = calculate_atr(df, lookback=atr_lookback)
-
-    if "health_score" not in df.columns:
-        df["health_score"] = 5.0
-
-    df = calculate_price_bands(df)
-
-    # Entry logic
-    df["buy_signal"] = (df["health_score"] >= buy_threshold) & (df["rvol"] >= rvol_threshold) & (df["extension"] < 0)
-    df["sell_signal"] = (df["health_score"] <= sell_threshold) & (df["rvol"] >= rvol_threshold) & (df["extension"] > 0)
-    df["strong_buy"] = df["buy_signal"] & (df["rvol"] > 2.0) & (df["extension"] < -0.5)
-    df["strong_sell"] = df["sell_signal"] & (df["rvol"] > 2.0) & (df["extension"] > 0.5)
-
-    return df
-
-# ------------------------------
-# Backtesting with R:R and forced exit
-# ------------------------------
-
-def backtest_signals(price_df: pd.DataFrame, signals_df: pd.DataFrame,
-                     initial_capital: float = 100000, leverage: float = 1.0,
-                     lot_size: float = 1.0, rr_per_trade: float = 0.02, forced_exit_rr: float = 0.10):
-    df = price_df.copy()
-    df = pd.merge(df, signals_df[["date", "buy_signal", "sell_signal", "strong_buy", "strong_sell"]], on="date", how="left")
-    df.fillna(False, inplace=True)
-
-    df["position"] = 0
-    entry_price = None
-    max_rr_achieved = 0.0
-    rr_list = []
-
-    for i in range(1, len(df)):
-        # Entry
-        if df.loc[i, "buy_signal"]:
-            df.loc[i, "position"] = 1
-            entry_price = df.loc[i, "close"]
-        elif df.loc[i, "sell_signal"]:
-            df.loc[i, "position"] = -1
-            entry_price = df.loc[i, "close"]
-        else:
-            df.loc[i, "position"] = df.loc[i - 1, "position"]
-
-        # Exit based on forced RR
-        if entry_price is not None:
-            move = (df.loc[i, "close"] - entry_price) / entry_price if df.loc[i, "position"] > 0 else (entry_price - df.loc[i, "close"]) / entry_price
-            rr_list.append(move / rr_per_trade)
-            max_rr_achieved = max(max_rr_achieved, move / rr_per_trade)
-            if move >= forced_exit_rr:
-                df.loc[i, "position"] = 0
-                entry_price = None
-
+    df = df.copy()
     df["returns"] = df["close"].pct_change().fillna(0.0)
+    df = df.merge(signals[["date", "signal"]], on="date", how="left")
+    df["position"] = df["signal"].ffill().fillna(0)
+
+    # Track per-trade R:R
+    trade_entry_price = None
+    rr_tracker = []
+    positions = []
+
+    for i, row in df.iterrows():
+        pos = row["position"]
+        close = row["close"]
+
+        if pos != 0 and trade_entry_price is None:
+            trade_entry_price = close
+            trade_rr = 0.0
+        elif pos != 0 and trade_entry_price is not None:
+            trade_rr = abs(close - trade_entry_price) / (rr_per_trade * trade_entry_price)
+            if trade_rr >= max_rr:
+                pos = 0
+                trade_entry_price = None
+        else:
+            trade_entry_price = None
+            trade_rr = 0.0
+        rr_tracker.append(trade_rr)
+        positions.append(pos)
+
+    df["position"] = positions
     df["strategy_returns"] = df["returns"] * df["position"].shift(1) * leverage * lot_size
-    df["capital"] = initial_capital * (1 + df["strategy_returns"].cumsum())
+    df["cum_returns"] = (1 + df["strategy_returns"]).cumprod() * initial_capital
 
     metrics = {
-        "max_rr": max_rr_achieved,
-        "average_rr": np.mean(rr_list) if rr_list else 0.0
+        "total_return": df["cum_returns"].iloc[-1] - initial_capital,
+        "max_rr": max_rr,
+        "avg_rr": np.mean(rr_tracker)
     }
-
     return df, metrics
 
 # ------------------------------
-# Main function
+# Main
 # ------------------------------
 
 def main():
-    st.title("COT + Price Backtester")
+    st.title("Market Backtester")
+    st.sidebar.header("Backtest Parameters")
 
-    start_date = st.sidebar.date_input("Start Date", datetime(2023, 1, 1))
-    end_date = st.sidebar.date_input("End Date", datetime.today())
-
-    buy_threshold = st.sidebar.slider("Buy Threshold", 0.0, 10.0, 7.0)
-    sell_threshold = st.sidebar.slider("Sell Threshold", 0.0, 10.0, 3.0)
-    rr_per_trade = st.sidebar.number_input("1R (%)", value=2.0, step=0.1) / 100.0
-    forced_exit_rr = st.sidebar.number_input("Forced Exit R (%)", value=10.0, step=0.5) / 100.0
+    # Sidebar controls
+    asset = st.sidebar.selectbox("Select Asset", options=[a.symbol for a in assets_list])
+    initial_capital = st.sidebar.number_input("Starting Capital", value=10000.0, step=1000.0)
     leverage = st.sidebar.number_input("Leverage", value=1.0, step=0.1)
     lot_size = st.sidebar.number_input("Lot Size", value=1.0, step=0.1)
+    rr_per_trade = st.sidebar.slider("R:R per trade", min_value=0.005, max_value=0.1, value=0.02, step=0.005)
+    max_rr = st.sidebar.slider("Max R:R Forced Exit", min_value=1.0, max_value=10.0, value=5.0, step=0.5)
     atr_lookback = st.sidebar.number_input("ATR Lookback", value=14, step=1)
-    rvol_lookback = st.sidebar.number_input("RVOL Lookback", value=20, step=1)
+    rvol_lookback = st.sidebar.number_input("RVol Lookback", value=20, step=1)
+    buy_threshold = st.sidebar.slider("Buy Signal Threshold", 0.0, 1.0, 0.5, 0.01)
+    sell_threshold = st.sidebar.slider("Sell Signal Threshold", 0.0, 1.0, 0.5, 0.01)
 
-    selected_asset = st.sidebar.selectbox("Select Asset", list(assets.keys()))
+    # Fetch data
+    start_date_pd = pd.to_datetime("2023-01-01")
+    end_date_pd = pd.to_datetime("2025-01-01")
+    cot_results, price_results = fetch_all_data([asset], start_date_pd, end_date_pd)
+    merged = merge_cot_price(cot_results[asset], price_results[asset])
+    merged = calculate_price_bands(merged)
+    merged = calculate_rvol(merged, rvol_lookback)
+    merged["atr"] = calculate_atr(merged, atr_lookback)
 
-    if st.sidebar.button("Run Backtest"):
-        start_date_pd = pd.Timestamp(start_date)
-        end_date_pd = pd.Timestamp(end_date)
+    # Generate signals
+    signals_df = generate_signals(merged, buy_threshold=buy_threshold, sell_threshold=sell_threshold,
+                                  rvol_threshold=1.5, atr_lookback=atr_lookback, rvol_lookback=rvol_lookback)
 
-        with st.spinner("Fetching data..."):
-            cot_df = fetch_cot_data(selected_asset)
-            price_df = fetch_price_data_yahoo(assets[selected_asset], start_date_pd.isoformat(), end_date_pd.isoformat())
-            if price_df.empty or cot_df.empty:
-                st.warning(f"No data for {selected_asset}")
-                return
-            price_df = calculate_rvol(price_df, window=rvol_lookback)
-            merged = merge_cot_price(cot_df, price_df)
-            merged["health_score"] = calculate_health_gauge(cot_df, merged)
+    # Calculate health
+    health_score = calculate_health_gauge(cot_results[asset], merged)
+    st.metric("Health Gauge", f"{health_score:.2f}/10")
 
-        signals_df = generate_signals(merged, buy_threshold=buy_threshold, sell_threshold=sell_threshold,
-                                      rvol_threshold=1.5, atr_lookback=atr_lookback, rvol_lookback=rvol_lookback)
-        backtest_df, metrics = backtest_signals(merged, signals_df,
-                                                initial_capital=100000, leverage=leverage,
-                                                lot_size=lot_size, rr_per_trade=rr_per_trade,
-                                                forced_exit_rr=forced_exit_rr)
+    # Backtest
+    backtest_df, metrics = backtest_signals(merged, signals_df, initial_capital=initial_capital,
+                                            leverage=leverage, lot_size=lot_size,
+                                            rr_per_trade=rr_per_trade, max_rr=max_rr)
 
-        st.subheader(f"{selected_asset} Backtest Results")
-        st.line_chart(backtest_df[["capital"]])
-        st.write(backtest_df.tail(10))
-        st.metric("Max R:R achieved", round(metrics["max_rr"], 2))
-        st.metric("Average R:R per trade", round(metrics["average_rr"], 2))
+    st.subheader("Backtest Metrics")
+    st.json(metrics)
+
+    st.subheader("Equity Curve")
+    st.line_chart(backtest_df.set_index("date")["cum_returns"])
 
 if __name__ == "__main__":
     main()
