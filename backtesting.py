@@ -795,4 +795,20 @@ def main():
                 st.warning("No trades executed in this backtest.")
 
 if __name__ == "__main__":
-    main()
+
+    # --- Set Ticker ---
+    ticker = "GC=F"  # Example: Gold Futures
+
+    # --- Fetch and Process Data ---
+    price_df = fetch_price_data(ticker)
+    latest_report, _ = get_last_two_reports(client)
+    cot_df = latest_report  # Latest COT report
+    df = merge_cot_price(cot_df, price_df)
+    df = generate_features(df)
+    df = generate_signals(df)
+    df = calculate_health(df)
+    df = calculate_bands(df)
+    df = backtest(df)
+
+    # --- Build Dashboard ---
+    build_dashboard(df, ticker)
