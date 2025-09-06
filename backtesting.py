@@ -69,14 +69,18 @@ class ExitTimingModel(nn.Module):
         x = self.layer3(x)
         return x
 
+# --- Calculate Relative Volume (RVOL) ---
 def calculate_rvol(df, volume_window=20):
-    """Calculate Relative Volume (RVOL)"""
     if 'volume' in df.columns:
         df = df.copy()
         df['volume_20ma'] = df['volume'].rolling(volume_window).mean()
         df['rvol'] = df['volume'] / df['volume_20ma']
+    else:
+        df['volume_20ma'] = np.nan
+        df['rvol'] = np.nan
     return df
 
+# --- Fetch COT Data ---
 def fetch_cot_data(market_name: str, max_attempts: int = 3) -> pd.DataFrame:
     logger.info(f"Fetching COT data for {market_name}")
     where_clause = f'market_and_exchange_names="{market_name}"'
@@ -110,30 +114,28 @@ def fetch_cot_data(market_name: str, max_attempts: int = 3) -> pd.DataFrame:
     logger.error(f"Failed fetching COT data for {market_name} after {max_attempts} attempts.")
     return pd.DataFrame()
 
-# --- Fetch historical price data (patched to include volume) ---
+# --- Fetch Historical Price Data ---
 def fetch_price_data(ticker_symbol: str, start_date=None, end_date=None, period="2y", interval="1d") -> pd.DataFrame:
     logger.info(f"Fetching price data for {ticker_symbol}")
     tk = Ticker(ticker_symbol)
 
-    # Use date range if provided, otherwise use period
     if start_date and end_date:
         df = tk.history(start=start_date, end=end_date, interval=interval).reset_index()
     else:
         df = tk.history(period=period, interval=interval).reset_index()
 
     df["date"] = pd.to_datetime(df["date"])
-    # Keep close price and volume
-    if "close" not in df.columns or "volume" not in df.columns:
-        df["close"] = df["adjclose"] if "adjclose" in df.columns else df["close"]
-        df["volume"] = df["volume"] if "volume" in df.columns else 0
-    df = df[["date", "close", "volume"]].sort_values("date")
+    df = df[["date", "close"]].sort_values("date")
+    if 'volume' not in df.columns:
+        df['volume'] = np.nan  # Ensure volume exists
     return df
+
 
 # --- Feature Engineering ---
 def prepare_features(df):
     df_features = df.copy()
-
-    # Technical indicators
+    
+    # Basic technical indicators
     df_features['returns'] = df_features['close'].pct_change()
     df_features['log_returns'] = np.log(df_features['close']).diff()
     df_features['rolling_mean_5'] = df_features['close'].rolling(5).mean()
@@ -143,90 +145,66 @@ def prepare_features(df):
     df_features['momentum_5'] = df_features['close'] / df_features['close'].shift(5) - 1
     df_features['momentum_20'] = df_features['close'] / df_features['close'].shift(20) - 1
 
-    # COT features
+    # COT features if available
     if 'commercial_net' in df_features.columns:
         df_features['comm_net_change'] = df_features['commercial_net'].diff()
     if 'non_commercial_net' in df_features.columns:
         df_features['non_comm_net_change'] = df_features['non_commercial_net'].diff()
 
-    # Price extension & health gauge if available
-    if 'extension' in df_features.columns:
-        df_features['extension_abs'] = df_features['extension'].abs()
-    if 'health_gauge' in df_features.columns:
-        df_features['health_change'] = df_features['health_gauge'].diff()
-
+    # Drop NaN values
     df_features.dropna(inplace=True)
     return df_features
 
+# --- Train Neural Network Exit Timing Model ---
 def train_exit_model(df, epochs=50):
-    if 'position' not in df.columns:
-        df['position'] = 0
-    if 'buy_signal' not in df.columns:
-        df['buy_signal'] = False
-    if 'sell_signal' not in df.columns:
-        df['sell_signal'] = False
-
     feature_cols = ['returns', 'log_returns', 'rolling_mean_5', 'rolling_mean_20',
                     'rolling_std_5', 'rolling_std_20', 'momentum_5', 'momentum_20']
-
-    # Ensure all feature columns exist
-    for col in feature_cols:
-        if col not in df.columns:
-            if col == 'returns':
-                df['returns'] = df['close'].pct_change()
-            elif col == 'log_returns':
-                df['log_returns'] = np.log(df['close']).diff()
-            elif col == 'rolling_mean_5':
-                df['rolling_mean_5'] = df['close'].rolling(5).mean()
-            elif col == 'rolling_mean_20':
-                df['rolling_mean_20'] = df['close'].rolling(20).mean()
-            elif col == 'rolling_std_5':
-                df['rolling_std_5'] = df['close'].rolling(5).std()
-            elif col == 'rolling_std_20':
-                df['rolling_std_20'] = df['close'].rolling(20).std()
-            elif col == 'momentum_5':
-                df['momentum_5'] = df['close'] / df['close'].shift(5) - 1
-            elif col == 'momentum_20':
-                df['momentum_20'] = df['close'] / df['close'].shift(20) - 1
-
-    if 'commercial_net' in df.columns and 'comm_net_change' not in df.columns:
-        df['comm_net_change'] = df['commercial_net'].diff()
-    if 'non_commercial_net' in df.columns and 'non_comm_net_change' not in df.columns:
-        df['non_comm_net_change'] = df['non_commercial_net'].diff()
-
+    
     if 'commercial_net' in df.columns:
         feature_cols.extend(['commercial_net', 'non_commercial_net', 'comm_net_change', 'non_comm_net_change'])
+    
+    # Add position & signal placeholders
+    for col in ['position', 'buy_signal', 'sell_signal']:
+        if col not in df.columns:
+            df[col] = 0
 
     feature_cols.extend(['position', 'buy_signal', 'sell_signal'])
 
-    # Target: 5-day future returns
+    # Target: future 5-day returns
     df['future_returns_5d'] = df['close'].pct_change(5).shift(-5)
     df.dropna(inplace=True)
+    
     if len(df) < 10:
         raise ValueError("Not enough data points after preparing features")
 
     X = df[feature_cols].values
     y = df['future_returns_5d'].values.reshape(-1, 1)
 
+    # Scale features & target
     scaler_X = MinMaxScaler()
     scaler_y = MinMaxScaler()
     X_scaled = scaler_X.fit_transform(X)
     y_scaled = scaler_y.fit_transform(y)
 
+    # Train-test split
     X_train, X_test, y_train, y_test = train_test_split(X_scaled, y_scaled, test_size=0.2, random_state=42)
 
+    # PyTorch tensors
     X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
     y_train_tensor = torch.tensor(y_train, dtype=torch.float32)
     X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
     y_test_tensor = torch.tensor(y_test, dtype=torch.float32)
 
+    # Dataset & DataLoader
     train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
 
+    # Model initialization
     model = ExitTimingModel(input_size=len(feature_cols))
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
 
+    # Training loop
     logger.info("Training exit timing model...")
     for epoch in range(epochs):
         model.train()
@@ -238,10 +216,10 @@ def train_exit_model(df, epochs=50):
             loss.backward()
             optimizer.step()
             running_loss += loss.item()
-
-        if (epoch + 1) % 10 == 0:
+        if (epoch+1) % 10 == 0:
             logger.info(f'Epoch [{epoch+1}/{epochs}], Loss: {running_loss/len(train_loader):.4f}')
 
+    # Evaluate
     model.eval()
     with torch.no_grad():
         test_predictions = model(X_test_tensor)
@@ -257,56 +235,68 @@ def backtest_strategy_with_nn(price_df, cot_df, exit_model=None, feature_scaler=
 
     df = price_df.copy()
 
-    # Merge COT data
+    # Merge COT data if available
     if not cot_df.empty:
-        df = df.merge(cot_df[["report_date", "commercial_net", "non_commercial_net"]],
-                     left_on="date", right_on="report_date", how="left")
-        df.fillna(method="ffill", inplace=True)
+        df = df.merge(cot_df[['report_date', 'commercial_net', 'non_commercial_net']],
+                      left_on='date', right_on='report_date', how='left')
+        df.fillna(method='ffill', inplace=True)
 
-    # Ensure volume_20ma and rvol exist
-    if "volume_20ma" not in df.columns or "rvol" not in df.columns:
-        df["volume_20ma"] = df["volume"].rolling(20).mean()
-        df["rvol"] = df["volume"] / df["volume_20ma"]
+    # Ensure volume column exists and calculate RVOL
+    if 'volume' not in df.columns:
+        df['volume'] = np.nan
+    df['volume_20ma'] = df['volume'].rolling(20).mean()
+    df['rvol'] = df['volume'] / df['volume_20ma']
 
-    # Placeholder for extension and health_gauge if missing
-    if "extension" not in df.columns:
-        df["extension"] = 0.0
-    if "health_gauge" not in df.columns:
-        df["health_gauge"] = 5.0
+    # Placeholder for price extension & health gauge
+    if 'extension' not in df.columns:
+        df['extension'] = 0.0
+    if 'health_gauge' not in df.columns:
+        df['health_gauge'] = 5.0  # Neutral
 
-    # Generate signals
-    buy_threshold, sell_threshold, rvol_threshold = 7.0, 3.0, 1.5
-    df["buy_signal"] = (df["health_gauge"] >= buy_threshold) & (df["rvol"] >= rvol_threshold) & (df["extension"] < 0)
-    df["sell_signal"] = (df["health_gauge"] <= sell_threshold) & (df["rvol"] >= rvol_threshold) & (df["extension"] > 0)
-    df["strong_buy"] = df["buy_signal"] & (df["rvol"] > 2.0) & (df["extension"] < -0.5)
-    df["strong_sell"] = df["sell_signal"] & (df["rvol"] > 2.0) & (df["extension"] > 0.5)
+    # Generate buy/sell signals
+    buy_threshold = 7.0
+    sell_threshold = 3.0
+    rvol_threshold = 1.5
+
+    df['buy_signal'] = (df['health_gauge'] >= buy_threshold) & (df['rvol'] >= rvol_threshold) & (df['extension'] < 0)
+    df['sell_signal'] = (df['health_gauge'] <= sell_threshold) & (df['rvol'] >= rvol_threshold) & (df['extension'] > 0)
+    df['strong_buy'] = df['buy_signal'] & (df['rvol'] > 2.0) & (df['extension'] < -0.5)
+    df['strong_sell'] = df['sell_signal'] & (df['rvol'] > 2.0) & (df['extension'] > 0.5)
 
     # Initialize positions
-    df["position"] = 0
-    df["exit_countdown"] = 0
-    current_position, exit_timer = 0, 0
+    df['position'] = 0
+    df['exit_countdown'] = 0
+    current_position = 0
+    exit_timer = 0
 
+    # Prepare features if NN model is used
     if exit_model is not None:
         df = prepare_features(df)
 
-    # Trading loop
-    for i in range(1, len(df)):
-        if df["strong_buy"].iloc[i] and current_position <= 0:
-            current_position, exit_timer = 1, 0
-        elif df["strong_sell"].iloc[i] and current_position >= 0:
-            current_position, exit_timer = -1, 0
-        elif df["buy_signal"].iloc[i] and current_position <= 0 and not df["strong_sell"].iloc[i]:
-            current_position, exit_timer = 1, 0
-        elif df["sell_signal"].iloc[i] and current_position >= 0 and not df["strong_buy"].iloc[i]:
-            current_position, exit_timer = -1, 0
 
-        # Countdown exit timer
+# Main trading loop
+    for i in range(1, len(df)):
+        # Entry signals
+        if df["strong_buy"].iloc[i] and current_position <= 0:
+            current_position = 1
+            exit_timer = 0
+        elif df["strong_sell"].iloc[i] and current_position >= 0:
+            current_position = -1
+            exit_timer = 0
+        elif df["buy_signal"].iloc[i] and current_position <= 0 and not df["strong_sell"].iloc[i]:
+            current_position = 1
+            exit_timer = 0
+        elif df["sell_signal"].iloc[i] and current_position >= 0 and not df["strong_buy"].iloc[i]:
+            current_position = -1
+            exit_timer = 0
+
+        # Exit timing countdown
         if exit_timer > 0:
             exit_timer -= 1
             if exit_timer == 0:
                 current_position = 0
 
-        # Neural network exit
+        # Neural network-based exit
         if exit_model is not None and i > 20:
             feature_cols = ['returns', 'log_returns', 'rolling_mean_5', 'rolling_mean_20',
                             'rolling_std_5', 'rolling_std_20', 'momentum_5', 'momentum_20']
@@ -327,12 +317,13 @@ def backtest_strategy_with_nn(price_df, cot_df, exit_model=None, feature_scaler=
             except Exception as e:
                 logger.error(f"Error in neural network prediction: {e}")
 
-        # Risk management extreme extension
+        # Risk management exits
         if current_position > 0 and df["extension"].iloc[i] > 0.9:
             current_position = 0
         elif current_position < 0 and df["extension"].iloc[i] < -0.9:
             current_position = 0
 
+        # Opposite signal triggers
         if current_position > 0 and df["sell_signal"].iloc[i] and exit_timer == 0:
             exit_timer = exit_days
         elif current_position < 0 and df["buy_signal"].iloc[i] and exit_timer == 0:
@@ -344,13 +335,13 @@ def backtest_strategy_with_nn(price_df, cot_df, exit_model=None, feature_scaler=
     # Compute returns
     df["returns"] = df["close"].pct_change() * df["position"].shift(1)
     df["total"] = (1 + df["returns"]).fillna(1).cumprod()
+
     return df
 
-# --- Main ---
+# --- Streamlit Main App ---
 def main():
     st.title("Trading Strategy Backtester with Neural Network Exit Timing")
 
-    # Sidebar
     st.sidebar.header("Configuration")
     start_date = st.sidebar.date_input("Start Date", datetime.date(2023, 1, 1))
     end_date = st.sidebar.date_input("End Date", datetime.date(2024, 1, 1))
@@ -370,13 +361,14 @@ def main():
             if cot_df.empty:
                 st.warning(f"No COT data for {selected_asset}, using price data only.")
 
-            # NN exit training
+            # Neural network training
             exit_model, feature_scaler, target_scaler = None, None, None
             if use_nn and len(price_df) > 100:
                 st.info("Training neural network for exit timing...")
                 exit_model, feature_scaler, target_scaler = train_exit_model(price_df.copy(), epochs=30)
                 st.success("Neural network trained successfully!")
 
+            # Run backtest
             backtest_results = backtest_strategy_with_nn(
                 price_df,
                 cot_df if not cot_df.empty else pd.DataFrame(),
@@ -386,6 +378,7 @@ def main():
                 exit_days=exit_days
             )
 
+            # Display metrics
             metrics = calculate_metrics(backtest_results)
             st.subheader("Backtest Results")
             col1, col2 = st.columns(2)
@@ -393,28 +386,29 @@ def main():
                 st.write("### Performance Metrics")
                 for k, v in metrics.items():
                     st.write(f"{k}: {v:.2%}" if isinstance(v, float) else f"{k}: {v}")
-
             with col2:
                 st.write("### Position Summary")
                 position_counts = backtest_results["position"].value_counts()
-                st.write(f"Long Positions: {position_counts.get(1, 0)}")
-                st.write(f"Short Positions: {position_counts.get(-1, 0)}")
-                st.write(f"Neutral Positions: {position_counts.get(0, 0)}")
+                st.write(f"Long Positions: {position_counts.get(1,0)}")
+                st.write(f"Short Positions: {position_counts.get(-1,0)}")
+                st.write(f"Neutral Positions: {position_counts.get(0,0)}")
 
+            # Plot equity curve
             st.subheader("Equity Curve")
             plot_equity(backtest_results, symbol)
 
+            # Plot positions
             st.subheader("Positions and Signals")
-            fig, ax = plt.subplots(figsize=(12, 6))
+            fig, ax = plt.subplots(figsize=(12,6))
             ax.plot(backtest_results["date"], backtest_results["close"], label="Price")
-            ax.scatter(backtest_results.loc[backtest_results["position"] == 1, "date"],
-                       backtest_results.loc[backtest_results["position"] == 1, "close"],
+            ax.scatter(backtest_results.loc[backtest_results["position"]==1, "date"],
+                       backtest_results.loc[backtest_results["position"]==1, "close"],
                        color="green", label="Long", marker="^")
-            ax.scatter(backtest_results.loc[backtest_results["position"] == -1, "date"],
-                       backtest_results.loc[backtest_results["position"] == -1, "close"],
+            ax.scatter(backtest_results.loc[backtest_results["position"]==-1, "date"],
+                       backtest_results.loc[backtest_results["position"]==-1, "close"],
                        color="red", label="Short", marker="v")
-            ax.scatter(backtest_results.loc[(backtest_results["position"].shift(1) != 0) & (backtest_results["position"] == 0), "date"],
-                       backtest_results.loc[(backtest_results["position"].shift(1) != 0) & (backtest_results["position"] == 0), "close"],
+            ax.scatter(backtest_results.loc[(backtest_results["position"].shift(1)!=0) & (backtest_results["position"]==0), "date"],
+                       backtest_results.loc[(backtest_results["position"].shift(1)!=0) & (backtest_results["position"]==0), "close"],
                        color="black", label="Exit", marker="x")
             ax.set_title(f"Positions for {symbol}")
             ax.set_xlabel("Date")
@@ -425,11 +419,11 @@ def main():
 
             # Exit countdown histogram
             if "exit_countdown" in backtest_results.columns:
-                non_zero_countdowns = backtest_results[backtest_results["exit_countdown"] > 0]["exit_countdown"]
+                non_zero_countdowns = backtest_results[backtest_results["exit_countdown"]>0]["exit_countdown"]
                 if len(non_zero_countdowns) > 0:
                     st.subheader("Exit Countdown Distribution")
-                    fig, ax = plt.subplots(figsize=(10, 4))
-                    ax.hist(non_zero_countdowns, bins=range(1, exit_days + 2), alpha=0.7)
+                    fig, ax = plt.subplots(figsize=(10,4))
+                    ax.hist(non_zero_countdowns, bins=range(1, exit_days+2), alpha=0.7)
                     ax.set_xlabel("Days until exit")
                     ax.set_ylabel("Frequency")
                     ax.set_title("Distribution of Exit Countdown Values")
@@ -438,4 +432,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
