@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 SODAPY_APP_TOKEN = "PP3ezxaUTiGforvvbBUGzwRx7"
 client = Socrata("publicreporting.cftc.gov", SODAPY_APP_TOKEN, timeout=60)
 
-# --- Assets Mapping (without RBOB Gasoline and Heating Oil) ---
+# --- Assets Mapping ---
 assets = {
     "GOLD - COMMODITY EXCHANGE INC.": "GC=F",
     "SILVER - COMMODITY EXCHANGE INC.": "SI=F",
@@ -70,7 +70,6 @@ def fetch_cot_data(market_name: str, max_attempts: int = 3) -> pd.DataFrame:
                 df = pd.DataFrame.from_records(results)
                 df["report_date"] = pd.to_datetime(df["report_date_as_yyyy_mm_dd"], errors="coerce")
                 df["open_interest_all"] = pd.to_numeric(df.get("open_interest_all", pd.Series()), errors="coerce")
-                # derive nets safely
                 try:
                     df["commercial_net"] = pd.to_numeric(df.get("commercial_long_all", 0), errors="coerce") - pd.to_numeric(df.get("commercial_short_all", 0), errors="coerce")
                     df["non_commercial_net"] = pd.to_numeric(df.get("non_commercial_long_all", 0), errors="coerce") - pd.to_numeric(df.get("non_commercial_short_all", 0), errors="coerce")
@@ -88,6 +87,7 @@ def fetch_cot_data(market_name: str, max_attempts: int = 3) -> pd.DataFrame:
     logger.error("Failed fetching COT data for %s after %d attempts.", market_name, max_attempts)
     return pd.DataFrame()
 
+
 def fetch_price_data_yahoo(ticker: str, start_date: str, end_date: str, max_attempts: int = 3) -> pd.DataFrame:
     """Fetch daily price history from yahooquery for a given ticker and date range."""
     logger.info("Fetching Yahoo data for %s from %s to %s", ticker, start_date, end_date)
@@ -99,7 +99,6 @@ def fetch_price_data_yahoo(ticker: str, start_date: str, end_date: str, max_atte
             if hist is None or (isinstance(hist, pd.DataFrame) and hist.empty):
                 logger.warning("No price data for %s", ticker)
                 return pd.DataFrame()
-            # if MultiIndex (ticker, date), select ticker
             if isinstance(hist.index, pd.MultiIndex):
                 try:
                     hist = hist.loc[ticker]
@@ -136,6 +135,23 @@ def calculate_rvol(df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
     df["rvol"] = df[vol_col] / df[vol_col].rolling(window, min_periods=1).mean()
     return df
 
+
+def calculate_atr(df: pd.DataFrame, window: int = 14) -> pd.DataFrame:
+    """Calculate ATR for volatility-based signals."""
+    df = df.copy()
+    high_col = "high" if "high" in df.columns else "High"
+    low_col = "low" if "low" in df.columns else "Low"
+    close_col = "close" if "close" in df.columns else "Close"
+
+    df["H-L"] = df[high_col] - df[low_col]
+    df["H-PC"] = (df[high_col] - df[close_col].shift(1)).abs()
+    df["L-PC"] = (df[low_col] - df[close_col].shift(1)).abs()
+    df["TR"] = df[["H-L", "H-PC", "L-PC"]].max(axis=1)
+    df["ATR"] = df["TR"].rolling(window=window, min_periods=1).mean()
+    df.drop(columns=["H-L", "H-PC", "L-PC", "TR"], inplace=True)
+    return df
+
+
 def merge_cot_price(cot_df: pd.DataFrame, price_df: pd.DataFrame) -> pd.DataFrame:
     """Merge weekly COT onto daily prices using merge_asof. Forward-fill COT-derived fields."""
     if cot_df is None or cot_df.empty or price_df is None or price_df.empty:
@@ -158,8 +174,9 @@ def merge_cot_price(cot_df: pd.DataFrame, price_df: pd.DataFrame) -> pd.DataFram
     merged["non_commercial_net"] = merged["non_commercial_net"].ffill()
     return merged
 
-# --- Price extension bands / price-based features ---
+
 def calculate_price_bands(price_df: pd.DataFrame, lookback: int = 60) -> pd.DataFrame:
+    """Calculate price extension bands."""
     if price_df is None or price_df.empty:
         return price_df
     df = price_df.copy()
@@ -174,8 +191,9 @@ def calculate_price_bands(price_df: pd.DataFrame, lookback: int = 60) -> pd.Data
     df["extension"] = ((df[close_col] - df["mid_band"]) / (df["range"] / 2 + 1e-9)).fillna(0.0)
     return df
 
-# --- Health gauge calculation ---
+
 def calculate_health_gauge(cot_df: pd.DataFrame, price_df: pd.DataFrame) -> float:
+    """Calculate overall health score."""
     if cot_df is None or cot_df.empty or price_df is None or price_df.empty:
         return float("nan")
     price_df = price_df.copy()
@@ -187,26 +205,22 @@ def calculate_health_gauge(cot_df: pd.DataFrame, price_df: pd.DataFrame) -> floa
     # Open interest score (25%)
     try:
         oi_series = price_df["open_interest_all"].dropna()
-        if oi_series.empty:
-            oi_score = 0.0
-        else:
-            oi_norm = (oi_series - oi_series.min()) / (oi_series.max() - oi_series.min() + 1e-9)
-            oi_score = float(oi_norm.iloc[-1])
+        oi_score = float((oi_series.iloc[-1] - oi_series.min()) / (oi_series.max() - oi_series.min() + 1e-9)) if not oi_series.empty else 0.0
     except Exception:
         oi_score = 0.0
 
     # COT analytics (35%)
     try:
-        commercial = cot_df[["report_date", "commercial_net"]].dropna().copy()
+        commercial = cot_df[["report_date", "commercial_net"]].dropna()
         commercial["report_date"] = pd.to_datetime(commercial["report_date"], errors="coerce")
         short_term = commercial[commercial["report_date"] >= three_months_ago]
 
-        noncomm = cot_df[["report_date", "non_commercial_net"]].dropna().copy()
+        noncomm = cot_df[["report_date", "non_commercial_net"]].dropna()
         noncomm["report_date"] = pd.to_datetime(noncomm["report_date"], errors="coerce")
         long_term = noncomm[noncomm["report_date"] >= one_year_ago]
 
-        st_score = 0.0 if short_term.empty else float((short_term["commercial_net"].iloc[-1] - short_term["commercial_net"].min()) / (short_term["commercial_net"].max() - short_term["commercial_net"].min() + 1e-9))
-        lt_score = 0.0 if long_term.empty else float((long_term["non_commercial_net"].iloc[-1] - long_term["non_commercial_net"].min()) / (long_term["non_commercial_net"].max() - long_term["non_commercial_net"].min() + 1e-9))
+        st_score = float((short_term["commercial_net"].iloc[-1] - short_term["commercial_net"].min()) / (short_term["commercial_net"].max() - short_term["commercial_net"].min() + 1e-9)) if not short_term.empty else 0.0
+        lt_score = float((long_term["non_commercial_net"].iloc[-1] - long_term["non_commercial_net"].min()) / (long_term["non_commercial_net"].max() - long_term["non_commercial_net"].min() + 1e-9)) if not long_term.empty else 0.0
 
         cot_analytics_score = 0.4 * st_score + 0.6 * lt_score
     except Exception:
@@ -218,8 +232,8 @@ def calculate_health_gauge(cot_df: pd.DataFrame, price_df: pd.DataFrame) -> floa
         if recent.empty or "rvol" not in recent.columns:
             pv_score = 0.0
         else:
-            close_col = "close" if "close" in recent.columns else ("Close" if "Close" in recent.columns else None)
-            vol_col = "volume" if "volume" in recent.columns else ("Volume" if "Volume" in recent.columns else None)
+            close_col = "close" if "close" in recent.columns else "Close"
+            vol_col = "volume" if "volume" in recent.columns else "Volume"
             if close_col is None or vol_col is None:
                 pv_score = 0.0
             else:
@@ -239,349 +253,107 @@ def calculate_health_gauge(cot_df: pd.DataFrame, price_df: pd.DataFrame) -> floa
 
     return (0.25 * oi_score + 0.35 * cot_analytics_score + 0.40 * pv_score) * 10.0
 
-# --- Threaded batch fetch ---
-def fetch_batch(batch_assets: List[Tuple[str, str]], start_date: pd.Timestamp, end_date: pd.Timestamp,
-                cot_results: Dict[str, pd.DataFrame], price_results: Dict[str, pd.DataFrame], lock: threading.Lock):
-    for cot_name, ticker in batch_assets:
-        try:
-            cot_df = fetch_cot_data(cot_name)
-            if cot_df is None or cot_df.empty:
-                with lock:
-                    cot_results[cot_name] = pd.DataFrame()
-                    price_results[cot_name] = pd.DataFrame()
-                continue
-            price_df = fetch_price_data_yahoo(ticker, start_date.isoformat(), end_date.isoformat())
-            if price_df is None or price_df.empty:
-                with lock:
-                    cot_results[cot_name] = cot_df
-                    price_results[cot_name] = pd.DataFrame()
-                continue
-            price_df = calculate_rvol(price_df)
-            merged = merge_cot_price(cot_df, price_df)
-            merged["health_score"] = calculate_health_gauge(cot_df, merged)
-            with lock:
-                cot_results[cot_name] = cot_df
-                price_results[cot_name] = merged
-        except Exception as e:
-            logger.exception("Error loading data for %s: %s", cot_name, e)
-            with lock:
-                cot_results[cot_name] = pd.DataFrame()
-                price_results[cot_name] = pd.DataFrame()
-
-def fetch_all_data(assets_dict: Dict[str, str], start_date: pd.Timestamp, end_date: pd.Timestamp, batch_size: int = 5) -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]:
-    cot_results: Dict[str, pd.DataFrame] = {}
-    price_results: Dict[str, pd.DataFrame] = {}
-    lock = threading.Lock()
-    items = list(assets_dict.items())
-    batches = [items[i:i + batch_size] for i in range(0, len(items), batch_size)]
-
-    for i in range(0, len(batches), 2):
-        threads: List[threading.Thread] = []
-        for j in range(i, min(i + 2, len(batches))):
-            t = threading.Thread(target=fetch_batch, args=(batches[j], start_date, end_date, cot_results, price_results, lock), daemon=True)
-            t.start()
-            threads.append(t)
-        for t in threads:
-            t.join()
-        time.sleep(0.5)
-
-    return cot_results, price_results
-
-
 # ------------------------------
-# Signal generation
+# Signal generation and backtesting
 # ------------------------------
 
-def generate_signals(price_df: pd.DataFrame, buy_threshold: float = 7.0, sell_threshold: float = 3.0, rvol_threshold: float = 1.5) -> pd.DataFrame:
-    """Generate buy/sell signals based on health gauge, RVOL, and extension."""
+def generate_signals(price_df: pd.DataFrame, buy_threshold: float = 7.0, sell_threshold: float = 3.0,
+                     rvol_threshold: float = 1.5, atr_weight: float = 0.5) -> pd.DataFrame:
+    """Generate buy/sell signals with volatility-adjusted and microstructure logic."""
     if price_df is None or price_df.empty:
         return pd.DataFrame()
     df = price_df.copy()
+    df = calculate_rvol(df)
+    df = calculate_atr(df)
+    df = calculate_price_bands(df)
 
     if "health_score" not in df.columns:
         df["health_score"] = 5.0
 
-    df = calculate_price_bands(df)
-    df = calculate_rvol(df)
+    # Combined signal score
+    df["signal_score"] = df["health_score"] - atr_weight * df.get("ATR", 0) + df["extension"]
 
-    df["buy_signal"] = (df["health_score"] >= buy_threshold) & (df["rvol"] >= rvol_threshold) & (df["extension"] < 0)
-    df["sell_signal"] = (df["health_score"] <= sell_threshold) & (df["rvol"] >= rvol_threshold) & (df["extension"] > 0)
+    df["buy_signal"] = (df["signal_score"] >= buy_threshold) & (df["rvol"] >= rvol_threshold) & (df["extension"] < 0)
+    df["sell_signal"] = (df["signal_score"] <= sell_threshold) & (df["rvol"] >= rvol_threshold) & (df["extension"] > 0)
+
+    # Strong signals
     df["strong_buy"] = df["buy_signal"] & (df["rvol"] > 2.0) & (df["extension"] < -0.5)
     df["strong_sell"] = df["sell_signal"] & (df["rvol"] > 2.0) & (df["extension"] > 0.5)
     return df
 
-# ------------------------------
-# Exit Timing Neural Network
-# ------------------------------
 
-class ExitTimingModel(nn.Module):
-    def __init__(self, input_size, hidden_size=64, output_size=1):
-        super().__init__()
-        self.layer1 = nn.Linear(input_size, hidden_size)
-        self.layer2 = nn.Linear(hidden_size, hidden_size)
-        self.layer3 = nn.Linear(hidden_size, output_size)
-        self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(0.2)
-
-    def forward(self, x):
-        x = self.relu(self.layer1(x))
-        x = self.dropout(x)
-        x = self.relu(self.layer2(x))
-        x = self.dropout(x)
-        return self.layer3(x)
-
-def prepare_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["returns"] = df["close"].pct_change()
-    df["log_returns"] = np.log(df["close"]).diff()
-    df["rolling_mean_5"] = df["close"].rolling(5).mean()
-    df["rolling_mean_20"] = df["close"].rolling(20).mean()
-    df["rolling_std_5"] = df["close"].rolling(5).std()
-    df["rolling_std_20"] = df["close"].rolling(20).std()
-    df["momentum_5"] = df["close"] / df["close"].shift(5) - 1
-    df["momentum_20"] = df["close"] / df["close"].shift(20) - 1
-    if "commercial_net" in df.columns:
-        df["comm_net_change"] = df["commercial_net"].diff()
-    if "non_commercial_net" in df.columns:
-        df["non_comm_net_change"] = df["non_commercial_net"].diff()
-    if "extension" in df.columns:
-        df["extension_abs"] = df["extension"].abs()
-    if "health_score" in df.columns:
-        df["health_change"] = df["health_score"].diff()
-    df.dropna(inplace=True)
-    return df
-
-def train_exit_model(df: pd.DataFrame, epochs: int = 50, batch_size: int = 32, lr: float = 1e-3):
-    df = prepare_features(df.copy())
-    if df.empty or len(df) < 50:
-        raise ValueError("Not enough data to train exit model")
-
-    df["future_returns_5d"] = df["close"].pct_change(5).shift(-5)
-    df.dropna(inplace=True)
-    if df.empty:
-        raise ValueError("No data after computing future returns")
-
-    feature_cols = [
-        "returns", "log_returns", "rolling_mean_5", "rolling_mean_20",
-        "rolling_std_5", "rolling_std_20", "momentum_5", "momentum_20"
-    ]
-    for c in ["commercial_net", "non_commercial_net", "comm_net_change", "non_comm_net_change", "health_score", "extension"]:
-        if c in df.columns:
-            feature_cols.append(c)
-
-    X = df[feature_cols].values
-    y = df["future_returns_5d"].values.reshape(-1, 1)
-
-    scaler_X, scaler_y = MinMaxScaler(), MinMaxScaler()
-    X_scaled = scaler_X.fit_transform(X)
-    y_scaled = scaler_y.fit_transform(y)
-
-    X_train, X_test, y_train, y_test = train_test_split(X_scaled, y_scaled, test_size=0.2, random_state=42)
-    train_dataset = TensorDataset(torch.tensor(X_train, dtype=torch.float32), torch.tensor(y_train, dtype=torch.float32))
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-
-    model = ExitTimingModel(input_size=X.shape[1])
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.MSELoss()
-
-    for epoch in range(epochs):
-        model.train()
-        for xb, yb in train_loader:
-            optimizer.zero_grad()
-            loss = criterion(model(xb), yb)
-            loss.backward()
-            optimizer.step()
-        if (epoch + 1) % 10 == 0:
-            logger.info("Epoch %d/%d completed", epoch + 1, epochs)
-
-    model.eval()
-    with torch.no_grad():
-        preds = model(torch.tensor(X_test, dtype=torch.float32)).numpy()
-        test_loss = float(((preds - y_test) ** 2).mean())
-        logger.info("Exit model test MSE: %.6f", test_loss)
-
-    return model, scaler_X, scaler_y
-
-# ------------------------------
-# Backtesting
-# ------------------------------
-
-def backtest_signals(price_df: pd.DataFrame, signals_df: pd.DataFrame,
-                     initial_capital: float = 100000.0, leverage: float = 1.0, lot_size: float = 1.0):
-    """
-    Backtest signals. Returns (df, metrics).
-    Ensures 'returns' exists, computes strategy returns with leverage and lot_size,
-    tracks trades and a simple R:R (r_multiple).
-    """
-    if price_df is None or price_df.empty:
-        return pd.DataFrame(), {}
-
-    # copy and ensure returns exist
-    df = price_df.copy().sort_values("date").reset_index(drop=True)
-    if "returns" not in df.columns:
-        df["returns"] = df["close"].pct_change().fillna(0.0)
-
-    # merge signals
-    if signals_df is None or signals_df.empty:
-        signals_df = pd.DataFrame({"date": df["date"], "buy_signal": False, "sell_signal": False, "strong_buy": False, "strong_sell": False})
+def backtest_signals(price_df: pd.DataFrame, signals_df: pd.DataFrame, initial_capital: float = 100000,
+                     leverage: float = 1.0, lot_size: float = 1.0, rr_per_trade: float = 2.0, max_rr: float = 5.0):
+    """Backtest strategy with leverage, lot size, R:R, and forced exit after max RR."""
+    df = price_df.copy()
     df = pd.merge(df, signals_df[["date", "buy_signal", "sell_signal", "strong_buy", "strong_sell"]], on="date", how="left")
-    df[["buy_signal", "sell_signal", "strong_buy", "strong_sell"]] = df[["buy_signal", "sell_signal", "strong_buy", "strong_sell"]].fillna(False)
+    df.fillna(False, inplace=True)
 
-    # positions: 1 long, -1 short, 0 flat
     df["position"] = 0
-    trades = []
-    current_pos = 0
-    entry_price = None
-    entry_index = None
+    df["entry_price"] = np.nan
+    df["exit_price"] = np.nan
+    df["trade_rr"] = 0.0
+    df["strategy_returns"] = 0.0
+
+    in_trade = False
+    entry_price = 0.0
+    rr_target = rr_per_trade
+    max_rr_hit = False
 
     for i in range(1, len(df)):
-        new_pos = current_pos
-
-        # Entry logic: strong signals first, otherwise regular
-        if df.loc[i, "strong_buy"] and current_pos <= 0:
-            new_pos = 1
-        elif df.loc[i, "strong_sell"] and current_pos >= 0:
-            new_pos = -1
-        elif df.loc[i, "buy_signal"] and current_pos <= 0 and not df.loc[i, "strong_sell"]:
-            new_pos = 1
-        elif df.loc[i, "sell_signal"] and current_pos >= 0 and not df.loc[i, "strong_buy"]:
-            new_pos = -1
+        if not in_trade:
+            if df.loc[i, "buy_signal"]:
+                df.loc[i, "position"] = 1
+                entry_price = df.loc[i, "close"]
+                df.loc[i, "entry_price"] = entry_price
+                in_trade = True
+                max_rr_hit = False
+            elif df.loc[i, "sell_signal"]:
+                df.loc[i, "position"] = -1
+                entry_price = df.loc[i, "close"]
+                df.loc[i, "entry_price"] = entry_price
+                in_trade = True
+                max_rr_hit = False
         else:
-            new_pos = current_pos  # hold
+            # Compute trade R:R
+            if df.loc[i, "position"] == 1 or df.loc[i, "position"] == -1:
+                ret = (df.loc[i, "close"] - entry_price) / entry_price if df.loc[i, "position"] == 1 else (entry_price - df.loc[i, "close"]) / entry_price
+                df.loc[i, "trade_rr"] = ret / 0.02  # 1R = 2%
+                if df.loc[i, "trade_rr"] >= max_rr:
+                    df.loc[i, "exit_price"] = df.loc[i, "close"]
+                    df.loc[i, "position"] = 0
+                    in_trade = False
+                    max_rr_hit = True
+            if not max_rr_hit:
+                df.loc[i, "position"] = df.loc[i - 1, "position"]
 
-        # If position changes (exit or reverse), record trade(s)
-        if current_pos == 0 and new_pos != 0:
-            # entering a new position
-            entry_price = df.loc[i, "close"]
-            entry_index = i
-            current_pos = new_pos
-        elif current_pos != 0 and new_pos == 0:
-            # exiting to flat
-            exit_price = df.loc[i, "close"]
-            if current_pos == 1:
-                realized = (exit_price - entry_price) / entry_price
-            else:
-                realized = (entry_price - exit_price) / entry_price
-            r_multiple = realized / 0.01 if 0.01 != 0 else np.nan  # define 1R = 1% price move
-            trades.append({
-                "entry_index": entry_index,
-                "exit_index": i,
-                "entry_price": entry_price,
-                "exit_price": exit_price,
-                "position": current_pos,
-                "realized_return": realized,
-                "r_multiple": r_multiple
-            })
-            entry_price = None
-            entry_index = None
-            current_pos = 0
-        elif current_pos != 0 and new_pos != 0 and new_pos != current_pos:
-            # reversal: close old and open new at same price (treat as two events)
-            exit_price = df.loc[i, "close"]
-            if current_pos == 1:
-                realized = (exit_price - entry_price) / entry_price
-            else:
-                realized = (entry_price - exit_price) / entry_price
-            r_multiple = realized / 0.01 if 0.01 != 0 else np.nan
-            trades.append({
-                "entry_index": entry_index,
-                "exit_index": i,
-                "entry_price": entry_price,
-                "exit_price": exit_price,
-                "position": current_pos,
-                "realized_return": realized,
-                "r_multiple": r_multiple
-            })
-            # open new
-            entry_price = exit_price
-            entry_index = i
-            current_pos = new_pos
+        df.loc[i, "strategy_returns"] = df["returns"].iloc[i] * df.loc[i, "position"] * leverage * lot_size
 
-        df.loc[i, "position"] = current_pos
+    df["capital"] = initial_capital * (1 + df["strategy_returns"].cumsum())
+    metrics = {
+        "max_rr_achieved": df["trade_rr"].max(),
+        "final_capital": df["capital"].iloc[-1]
+    }
+    return df, metrics
 
-    # close any open position at the end
-    if current_pos != 0 and entry_price is not None:
-        last_i = len(df) - 1
-        exit_price = df.loc[last_i, "close"]
-        if current_pos == 1:
-            realized = (exit_price - entry_price) / entry_price
-        else:
-            realized = (entry_price - exit_price) / entry_price
-        r_multiple = realized / 0.01 if 0.01 != 0 else np.nan
-        trades.append({
-            "entry_index": entry_index,
-            "exit_index": last_i,
-            "entry_price": entry_price,
-            "exit_price": exit_price,
-            "position": current_pos,
-            "realized_return": realized,
-            "r_multiple": r_multiple
-        })
-        df.loc[last_i, "position"] = 0
-
-    # strategy returns: apply leverage and lot_size multiplier
-    df["strategy_returns"] = df["returns"] * df["position"].shift(1) * leverage * lot_size
-    # capital / total construction: cumulative product of (1 + strategy_returns)
-    df["capital"] = (1 + df["strategy_returns"].fillna(0.0)).cumprod() * initial_capital
-
-    # metrics
-    metrics = {}
-    if "capital" in df.columns and len(df) > 0:
-        total_return = df["capital"].iloc[-1] / initial_capital - 1
-        ann_return = (1 + total_return) ** (252 / len(df)) - 1 if len(df) > 0 else 0
-        ann_vol = df["strategy_returns"].std() * np.sqrt(252) if df["strategy_returns"].notna().any() else 0
-        sharpe = ann_return / ann_vol if ann_vol != 0 else np.nan
-        drawdown = df["capital"].cummax() - df["capital"]
-        max_dd = drawdown.max() if not drawdown.empty else 0
-        metrics = {
-            "Total Return": total_return,
-            "Annualized Return": ann_return,
-            "Annualized Volatility": ann_vol,
-            "Sharpe Ratio": sharpe,
-            "Max Drawdown": max_dd,
-            "Total Trades": len(trades),
-            "Winning Trades": sum(1 for t in trades if t["realized_return"] > 0),
-            "Avg R": np.mean([t["r_multiple"] for t in trades]) if trades else 0,
-            "Max R": np.max([t["r_multiple"] for t in trades]) if trades else 0
-        }
-
-    # attach trades as DataFrame for convenience
-    trades_df = pd.DataFrame(trades) if trades else pd.DataFrame()
-
-    return df, metrics, trades_df
-
-# --- Plot helpers ---
-def plot_backtest(df: pd.DataFrame, asset_name: str):
-    plt.figure(figsize=(12,6))
-    plt.plot(df["date"], df["capital"], label="Strategy Capital")
-    if "returns" in df.columns:
-        plt.plot(df["date"], (1 + df["returns"].cumsum()) * df["capital"].iloc[0], label="Buy & Hold")
-    plt.title(f"Backtest: {asset_name}")
-    plt.xlabel("Date")
-    plt.ylabel("Capital")
-    plt.legend()
-    plt.grid(True)
-    st.pyplot(plt)
-
-# ------------------------------
-# Main function
-# ------------------------------
 
 def main():
     st.title("COT + Price Backtester")
-    start_date = st.sidebar.date_input("Start Date", date(2023, 1, 1))
-    end_date = st.sidebar.date_input("End Date", date.today())
+    start_date = st.sidebar.date_input("Start Date", datetime(2023, 1, 1))
+    end_date = st.sidebar.date_input("End Date", datetime.today())
 
     selected_assets = st.sidebar.multiselect("Select Assets", list(assets.keys()), default=list(assets.keys())[:3])
 
-    # new sidebar controls requested earlier
-    initial_capital = st.sidebar.number_input("Starting Balance", value=100000.0, min_value=1000.0, step=1000.0)
-    leverage = st.sidebar.slider("Leverage", min_value=1.0, max_value=30.0, value=1.0, step=0.5)
-    lot_size = st.sidebar.select_slider("Lot size multiplier", options=[0.1, 0.2, 0.5, 1.0], value=1.0)
+    # Portfolio and backtest controls
+    initial_capital = st.sidebar.number_input("Starting Balance", value=100000.0, step=1000.0)
+    leverage = st.sidebar.slider("Leverage", min_value=1.0, max_value=10.0, value=1.0, step=0.1)
+    lot_size = st.sidebar.number_input("Lot Size", value=1.0, step=0.1)
     buy_threshold = st.sidebar.slider("Buy Threshold", 0.0, 10.0, 7.0, 0.1)
     sell_threshold = st.sidebar.slider("Sell Threshold", 0.0, 10.0, 3.0, 0.1)
-    exit_days = st.sidebar.slider("Exit Countdown Days", 1, 30, 5)
-    use_nn = st.sidebar.checkbox("Use Exit NN", value=False)
+    rvol_threshold = st.sidebar.slider("RVOL Threshold", 0.5, 5.0, 1.5, 0.1)
+    atr_weight = st.sidebar.slider("ATR Weight", 0.0, 2.0, 0.5, 0.05)
+    rr_per_trade = st.sidebar.slider("1R (%)", 0.5, 5.0, 2.0, 0.1)
+    max_rr = st.sidebar.slider("Max R for forced exit", 2.0, 10.0, 5.0, 0.5)
 
     if st.sidebar.button("Run Backtest"):
         start_date_pd = pd.Timestamp(start_date)
@@ -597,46 +369,18 @@ def main():
                 st.warning(f"No price data for {name}")
                 continue
 
-            # ensure price_df has 'close' column
-            if "close" not in price_df.columns and "Close" in price_df.columns:
-                price_df = price_df.rename(columns={"Close": "close"})
-
-            # generate signals using thresholds from sidebar
-            signals_df = generate_signals(price_df, buy_threshold=buy_threshold, sell_threshold=sell_threshold)
-
-            # optionally train exit model
-            exit_model = None
-            scaler_X = None
-            scaler_y = None
-            if use_nn and len(price_df) > 200:
-                try:
-                    exit_model, scaler_X, scaler_y = train_exit_model(price_df.copy(), epochs=30)
-                except Exception as e:
-                    st.warning(f"Could not train exit model for {name}: {e}")
-
-            backtest_df, metrics, trades_df = backtest_signals(price_df, signals_df, initial_capital=initial_capital, leverage=leverage, lot_size=lot_size)
-
+            signals_df = generate_signals(price_df, buy_threshold, sell_threshold, rvol_threshold, atr_weight)
+            backtest_df, metrics = backtest_signals(price_df, signals_df,
+                                                     initial_capital=initial_capital,
+                                                     leverage=leverage,
+                                                     lot_size=lot_size,
+                                                     rr_per_trade=rr_per_trade,
+                                                     max_rr=max_rr)
             st.subheader(f"{name} Backtest Results")
-            if metrics:
-                st.write("### Performance Metrics")
-                for k, v in metrics.items():
-                    if isinstance(v, float):
-                        st.write(f"{k}: {v:.4f}")
-                    else:
-                        st.write(f"{k}: {v}")
+            st.line_chart(backtest_df[["capital"]])
+            st.write("Metrics:", metrics)
+            st.write(backtest_df.tail(10))
 
-            # show capital chart
-            st.subheader("Equity Curve")
-            if not backtest_df.empty:
-                plot_backtest(backtest_df, name)
-                st.write(backtest_df.tail(10))
-            else:
-                st.warning("No backtest data to display")
-
-            # trades table
-            if not trades_df.empty:
-                st.subheader("Trades")
-                st.dataframe(trades_df)
 
 if __name__ == "__main__":
     main()
