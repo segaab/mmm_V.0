@@ -1,13 +1,27 @@
-# --- Chunk 1 ---
 import streamlit as st
 import pandas as pd
 import numpy as np
 import datetime
 import time
 import logging
+import threading
 import matplotlib.pyplot as plt
+import seaborn as sns
 from sodapy import Socrata
 from yahooquery import Ticker
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split
+
+# Set page config
+st.set_page_config(
+    page_title="Trading Strategy Backtester",
+    page_icon="📈",
+    layout="wide"
+)
 
 # --- Logging ---
 logging.basicConfig(level=logging.INFO)
@@ -63,7 +77,7 @@ def fetch_cot_data(market_name: str, max_attempts: int = 3) -> pd.DataFrame:
     logger.error(f"Failed fetching COT data for {market_name} after {max_attempts} attempts.")
     return pd.DataFrame()
 
-# --- Chunk 2 ---
+
 # --- Fetch Yahoo Price Data ---
 def fetch_yahooquery_data(ticker: str, start_date: str, end_date: str, max_attempts: int = 3) -> pd.DataFrame:
     logger.info(f"Fetching Yahoo data for {ticker} from {start_date} to {end_date}")
@@ -87,48 +101,43 @@ def fetch_yahooquery_data(ticker: str, start_date: str, end_date: str, max_attem
     logger.error(f"Failed fetching Yahoo data for {ticker} after {max_attempts} attempts.")
     return pd.DataFrame()
 
-# --- Merge Price and COT Data ---
-def merge_price_cot(price_df: pd.DataFrame, cot_df: pd.DataFrame) -> pd.DataFrame:
+# --- Helper Functions for Backtesting ---
+def load_price_data(asset_name, years_back):
+    ticker = assets[asset_name]
+    end_date = datetime.datetime.today()
+    start_date = end_date - datetime.timedelta(days=years_back*365)
+    return fetch_yahooquery_data(ticker, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
+
+def load_cot_data(asset_name):
+    return fetch_cot_data(asset_name)
+
+def merge_price_cot(price_df, cot_df):
     if price_df.empty or cot_df.empty:
         return pd.DataFrame()
-    merged = pd.merge(price_df, cot_df[["report_date", "commercial_net", "non_commercial_net"]], left_on="date", right_on="report_date", how="left")
-    merged.fillna(method="ffill", inplace=True)
-    return merged
-
-# --- Health Gauge Calculation ---
-def calculate_health_gauge(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-    df["hg_score"] = (df["commercial_net"] - df["non_commercial_net"]) / df["open"].replace(0, 1)
-    df["hg_score"] = df["hg_score"].fillna(0).clip(-1,1)
+    df = pd.merge(price_df, cot_df[["report_date", "commercial_net", "non_commercial_net"]],
+                  left_on="date", right_on="report_date", how="left")
+    df.fillna(0, inplace=True)
     return df
 
-# --- Generate Buy/Sell Signals ---
-def generate_signals(df: pd.DataFrame, buy_threshold: float = 0.3, sell_threshold: float = 0.7) -> pd.DataFrame:
+def calculate_health_gauge(df):
+    if df.empty:
+        return df
+    df["hg"] = (df["commercial_net"] - df["non_commercial_net"]) / (df["commercial_net"].abs() + df["non_commercial_net"].abs() + 1e-6)
+    df["hg"] = df["hg"].clip(-1, 1)
+    return df
+
+def generate_signals(df, buy_threshold=0.3, sell_threshold=0.7):
     if df.empty:
         return df
     df["signal"] = 0
-    df.loc[df["hg_score"] >= sell_threshold, "signal"] = -1
-    df.loc[df["hg_score"] <= buy_threshold, "signal"] = 1
+    df.loc[df["hg"] > sell_threshold, "signal"] = -1
+    df.loc[df["hg"] < buy_threshold, "signal"] = 1
     return df
 
-# --- Load Price Data Wrapper ---
-def load_price_data(asset_name: str, years_back: int) -> pd.DataFrame:
-    ticker = assets.get(asset_name, None)
-    if not ticker:
-        return pd.DataFrame()
-    end_date = datetime.datetime.today().strftime("%Y-%m-%d")
-    start_date = (datetime.datetime.today() - datetime.timedelta(days=years_back*365)).strftime("%Y-%m-%d")
-    return fetch_yahooquery_data(ticker, start_date, end_date)
 
-# --- Load COT Data Wrapper ---
-def load_cot_data(asset_name: str) -> pd.DataFrame:
-    return fetch_cot_data(asset_name)
-
-
-# --- Chunk 3 ---
 # --- Execute Backtest ---
-def execute_backtest(signals_df: pd.DataFrame, starting_balance=10000, leverage=15, lot_size=1.0):
+def execute_backtest(signals_df: pd.DataFrame, starting_balance=10000, leverage=15,
+                     lot_size=1.0, exit_rr=2.0, rr_percent=0.1):
     if signals_df.empty:
         return pd.DataFrame(), pd.DataFrame(), {}
 
@@ -142,19 +151,42 @@ def execute_backtest(signals_df: pd.DataFrame, starting_balance=10000, leverage=
         price_prev = signals_df.iloc[i-1]["close"]
 
         if signal != 0:
-            trade_return = (price_open - price_prev) / price_prev * leverage * signal * lot_size
-            balance *= (1 + trade_return)
-            trades.append({"date": signals_df.iloc[i]["date"], "signal": signal, "price": price_open, "balance": balance})
+            trade_capital = balance * rr_percent
+            trade_return = ((price_open - price_prev) / price_prev) * leverage * signal * lot_size
+            balance += trade_capital * trade_return
+            rr_actual = trade_return / exit_rr if exit_rr != 0 else 0
+            trades.append({
+                "date": signals_df.iloc[i]["date"],
+                "signal": signal,
+                "price": price_open,
+                "trade_return": trade_return,
+                "rr_actual": rr_actual,
+                "balance": balance
+            })
 
         equity_curve.append({"date": signals_df.iloc[i]["date"], "balance": balance})
 
     equity_df = pd.DataFrame(equity_curve)
     trades_df = pd.DataFrame(trades)
 
+    # Full RR metrics
+    wins = trades_df[trades_df["trade_return"] > 0].shape[0]
+    losses = trades_df[trades_df["trade_return"] <= 0].shape[0]
+    win_rate = wins / (wins + losses) if (wins + losses) > 0 else 0
+    average_rr = trades_df["rr_actual"].mean() if not trades_df.empty else 0
+    max_rr = trades_df["rr_actual"].max() if not trades_df.empty else 0
+    min_rr = trades_df["rr_actual"].min() if not trades_df.empty else 0
+
     metrics = {
         "final_balance": balance,
         "total_return": (balance - starting_balance) / starting_balance,
-        "num_trades": len(trades_df)
+        "num_trades": len(trades_df),
+        "wins": wins,
+        "losses": losses,
+        "win_rate": win_rate,
+        "average_rr": average_rr,
+        "max_rr": max_rr,
+        "min_rr": min_rr
     }
 
     return equity_df, trades_df, metrics
@@ -170,16 +202,18 @@ def main():
         selected_asset = st.selectbox("Select Asset", list(assets.keys()), index=0)
 
         # Time period
-        years_back = st.number_input("Years to Backtest", min_value=1, max_value=10, value=3, step=1)
+        years_back = st.slider("Years to Backtest", min_value=1, max_value=10, value=3)
 
         # Signal thresholds
-        buy_thresh = st.number_input("Buy Threshold", min_value=0.0, max_value=1.0, value=0.3, step=0.01)
-        sell_thresh = st.number_input("Sell Threshold", min_value=0.0, max_value=1.0, value=0.7, step=0.01)
+        buy_thresh = st.number_input("Buy Threshold", min_value=0.0, max_value=1.0, value=0.3, step=0.05)
+        sell_thresh = st.number_input("Sell Threshold", min_value=0.0, max_value=1.0, value=0.7, step=0.05)
 
-        # Backtest financial parameters
-        starting_balance = st.number_input("Starting Balance", min_value=1000.0, value=10000.0, step=1000.0)
-        leverage = st.number_input("Leverage", min_value=1, max_value=50, value=15, step=1)
-        lot_size = st.number_input("Lot Size (like broker)", min_value=0.01, value=1.0, step=0.01)
+        # Position parameters
+        lot_size = st.number_input("Lot Size", min_value=0.01, value=1.0, step=0.01)
+        exit_rr = st.number_input("Exit RR", min_value=0.1, value=2.0, step=0.1)
+        rr_percent = st.number_input("RR % of Capital per Trade", min_value=0.01, max_value=1.0, value=0.1, step=0.01)
+        starting_balance = st.number_input("Starting Balance", min_value=1000, value=10000, step=1000)
+        leverage = st.number_input("Leverage", min_value=1, value=15, step=1)
 
     # Load data
     price_df = load_price_data(selected_asset, years_back)
@@ -190,7 +224,12 @@ def main():
     signals_df = generate_signals(hg_df, buy_threshold=buy_thresh, sell_threshold=sell_thresh)
 
     # Backtest
-    equity_df, trades_df, metrics = execute_backtest(signals_df, starting_balance, leverage, lot_size)
+    equity_df, trades_df, metrics = execute_backtest(signals_df,
+                                                     starting_balance=starting_balance,
+                                                     leverage=leverage,
+                                                     lot_size=lot_size,
+                                                     exit_rr=exit_rr,
+                                                     rr_percent=rr_percent)
 
     # Display metrics
     st.subheader("Backtest Metrics")
@@ -213,4 +252,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
