@@ -143,14 +143,48 @@ def prepare_features(df):
     
     return df
 
-# --- Train Neural Network for Exit Timing ---
 def train_exit_model(df, epochs=50):
+    # First, ensure the dataframe has the required columns
+    if 'position' not in df.columns:
+        df['position'] = 0
+    if 'buy_signal' not in df.columns:
+        df['buy_signal'] = False
+    if 'sell_signal' not in df.columns:
+        df['sell_signal'] = False
+    
     # Prepare features
     feature_cols = ['returns', 'log_returns', 'rolling_mean_5', 'rolling_mean_20', 
                     'rolling_std_5', 'rolling_std_20', 'momentum_5', 'momentum_20']
     
-    if 'comm_net_change' in df.columns:
-        feature_cols.extend(['commercial_net', 'non_commercial_net', 'comm_net_change', 'non_comm_net_change'])
+    # Make sure all feature columns exist in the dataframe
+    for col in feature_cols:
+        if col not in df.columns:
+            if col == 'returns':
+                df['returns'] = df['close'].pct_change()
+            elif col == 'log_returns':
+                df['log_returns'] = np.log(df['close']).diff()
+            elif col == 'rolling_mean_5':
+                df['rolling_mean_5'] = df['close'].rolling(window=5).mean()
+            elif col == 'rolling_mean_20':
+                df['rolling_mean_20'] = df['close'].rolling(window=20).mean()
+            elif col == 'rolling_std_5':
+                df['rolling_std_5'] = df['close'].rolling(window=5).std()
+            elif col == 'rolling_std_20':
+                df['rolling_std_20'] = df['close'].rolling(window=20).std()
+            elif col == 'momentum_5':
+                df['momentum_5'] = df['close'] / df['close'].shift(5) - 1
+            elif col == 'momentum_20':
+                df['momentum_20'] = df['close'] / df['close'].shift(20) - 1
+    
+    if 'commercial_net' in df.columns and 'comm_net_change' not in df.columns:
+        df['comm_net_change'] = df['commercial_net'].diff()
+    
+    if 'non_commercial_net' in df.columns and 'non_comm_net_change' not in df.columns:
+        df['non_comm_net_change'] = df['non_commercial_net'].diff()
+    
+    if 'commercial_net' in df.columns:
+        if 'comm_net_change' in df.columns:
+            feature_cols.extend(['commercial_net', 'non_commercial_net', 'comm_net_change', 'non_comm_net_change'])
     
     # Add position and signal features
     feature_cols.extend(['position', 'buy_signal', 'sell_signal'])
@@ -159,6 +193,10 @@ def train_exit_model(df, epochs=50):
     # For simplicity, we'll use 5-day future returns as our target
     df['future_returns_5d'] = df['close'].pct_change(5).shift(-5)
     df.dropna(inplace=True)
+    
+    # Check if we have enough data after dropping NaN values
+    if len(df) < 10:
+        raise ValueError("Not enough data points after preparing features")
     
     X = df[feature_cols].values
     y = df['future_returns_5d'].values.reshape(-1, 1)
@@ -213,6 +251,8 @@ def train_exit_model(df, epochs=50):
         logger.info(f'Test Loss: {test_loss:.4f}')
     
     return model, scaler_X, scaler_y
+    
+
 # --- Backtest Strategy with Neural Network Exit Timing ---
 def backtest_strategy_with_nn(price_df, cot_df, exit_model=None, feature_scaler=None, target_scaler=None, exit_days=5):
     df = price_df.copy()
