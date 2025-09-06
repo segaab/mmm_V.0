@@ -1,3 +1,4 @@
+
 # ===== Chunk 1/3 =====
 import os
 import logging
@@ -213,7 +214,6 @@ def fetch_all_data(assets_dict: Dict[str, str], start_date: pd.Timestamp, end_da
             t.join()
         time.sleep(0.5)
     return cot_results, price_results
-
 
 # ===== Chunk 2/3 =====
 import math
