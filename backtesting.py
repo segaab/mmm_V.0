@@ -214,6 +214,7 @@ def fetch_all_data(assets_dict: Dict[str, str], start_date: pd.Timestamp, end_da
         time.sleep(0.5)
     return cot_results, price_results
 
+
 # ===== Chunk 2/3 =====
 import math
 import matplotlib.pyplot as plt
@@ -389,20 +390,41 @@ def train_exit_model(df: pd.DataFrame, epochs: int = 50, batch_size: int = 32, l
 # ===== end Chunk 2/3 =====
 
 # ===== Chunk 3/3 =====
-# --- Backtesting with Neural Network Exit Timing ---
-def backtest_strategy_with_nn(price_df: pd.DataFrame, cot_df: pd.DataFrame,
+
+# --- Performance Metrics ---
+def calculate_metrics(df: pd.DataFrame) -> dict:
+    returns = df["returns"].fillna(0)
+    total_return = df["total"].iloc[-1] / df["total"].iloc[0] - 1 if len(df) > 0 and df["total"].iloc[0] != 0 else 0
+    annualized_return = (1 + total_return) ** (252 / len(df)) - 1 if len(df) > 0 else 0
+    annualized_vol = returns.std() * np.sqrt(252) if len(returns) > 0 else 0
+    sharpe_ratio = annualized_return / annualized_vol if annualized_vol != 0 else np.nan
+    drawdown = df["total"].cummax() - df["total"] if "total" in df.columns else pd.Series([0])
+    max_drawdown = drawdown.max() if len(drawdown) > 0 else 0
+    return {
+        "Total Return": total_return,
+        "Annualized Return": annualized_return,
+        "Annualized Volatility": annualized_vol,
+        "Sharpe Ratio": sharpe_ratio,
+        "Max Drawdown": max_drawdown
+    }
+
+# --- Plot Equity Curve ---
+def plot_equity(df: pd.DataFrame, symbol: str):
+    plt.figure(figsize=(12, 6))
+    plt.plot(df["date"], df["total"], label=f"{symbol} Equity Curve")
+    plt.title(f"Equity Curve for {symbol}")
+    plt.xlabel("Date")
+    plt.ylabel("Portfolio Value")
+    plt.legend()
+    plt.grid(True)
+    st.pyplot(plt)
+
+# --- Backtesting with Neural Network ---
+def backtest_strategy_with_nn(df: pd.DataFrame, cot_df: pd.DataFrame = pd.DataFrame(),
                               exit_model=None, feature_scaler=None, target_scaler=None,
                               exit_days: int = 5) -> pd.DataFrame:
-    if price_df is None or price_df.empty:
-        return pd.DataFrame()
-
-    df = price_df.copy()
-    df = calculate_price_bands(df)
-    df = calculate_rvol(df)
-    health_df = calculate_health_gauge_series(cot_df, df)
-    df = generate_signals(health_df, df)
+    df = df.copy()
     df = prepare_features(df)
-
     df["position"] = 0
     df["exit_countdown"] = 0
     current_position = 0
@@ -433,9 +455,10 @@ def backtest_strategy_with_nn(price_df: pd.DataFrame, cot_df: pd.DataFrame,
         if exit_model is not None and i > 20:
             feature_cols = ['returns', 'log_returns', 'rolling_mean_5', 'rolling_mean_20',
                             'rolling_std_5', 'rolling_std_20', 'momentum_5', 'momentum_20']
-            extra_cols = ['commercial_net', 'non_commercial_net', 'comm_net_change', 'non_comm_net_change', 'health_gauge', 'extension']
-            feature_cols += [c for c in extra_cols if c in df.columns]
-            df.loc[df.index[i], 'position_temp'] = current_position
+            if 'comm_net_change' in df.columns:
+                feature_cols.extend(['commercial_net', 'non_commercial_net', 'comm_net_change', 'non_comm_net_change'])
+            feature_cols.extend(['position', 'buy_signal', 'sell_signal'])
+            df.loc[:, 'position'] = current_position
             try:
                 features = df.iloc[i][feature_cols].values.reshape(1, -1)
                 features_scaled = feature_scaler.transform(features)
@@ -447,7 +470,7 @@ def backtest_strategy_with_nn(price_df: pd.DataFrame, cot_df: pd.DataFrame,
                     if exit_timer == 0:
                         exit_timer = exit_days
             except Exception as e:
-                logger.error(f"NN exit prediction error: {e}")
+                logger.error(f"Error in neural network prediction: {e}")
 
         # Opposite signal triggers
         if current_position > 0 and df["sell_signal"].iloc[i] and exit_timer == 0:
@@ -458,47 +481,19 @@ def backtest_strategy_with_nn(price_df: pd.DataFrame, cot_df: pd.DataFrame,
         df.loc[df.index[i], "position"] = current_position
         df.loc[df.index[i], "exit_countdown"] = exit_timer
 
-    # Compute strategy returns
-    df["strategy_returns"] = df["close"].pct_change() * df["position"].shift(1)
-    df["equity_curve"] = (1 + df["strategy_returns"]).fillna(1).cumprod()
+    # Compute returns
+    df["returns"] = df["close"].pct_change() * df["position"].shift(1)
+    df["total"] = (1 + df["returns"]).fillna(1).cumprod()
 
     return df
 
-# --- Performance Metrics ---
-def calculate_metrics(df: pd.DataFrame) -> dict:
-    returns = df["strategy_returns"].fillna(0)
-    total_return = df["equity_curve"].iloc[-1] / df["equity_curve"].iloc[0] - 1 if len(df) > 0 else 0
-    annualized_return = (1 + total_return) ** (252 / len(df)) - 1 if len(df) > 0 else 0
-    annualized_vol = returns.std() * np.sqrt(252) if len(returns) > 0 else 0
-    sharpe_ratio = annualized_return / annualized_vol if annualized_vol != 0 else np.nan
-    drawdown = df["equity_curve"].cummax() - df["equity_curve"]
-    max_drawdown = drawdown.max() if len(drawdown) > 0 else 0
-    return {
-        "Total Return": total_return,
-        "Annualized Return": annualized_return,
-        "Annualized Volatility": annualized_vol,
-        "Sharpe Ratio": sharpe_ratio,
-        "Max Drawdown": max_drawdown
-    }
-
-# --- Plot Equity Curve ---
-def plot_equity(df: pd.DataFrame, symbol: str):
-    plt.figure(figsize=(12, 6))
-    plt.plot(df["date"], df["equity_curve"], label=f"{symbol} Equity Curve")
-    plt.title(f"Equity Curve for {symbol}")
-    plt.xlabel("Date")
-    plt.ylabel("Portfolio Value")
-    plt.legend()
-    plt.grid(True)
-    st.pyplot(plt)
-
-# ===== Main function =====
+# --- Streamlit Main App ---
 def main():
     st.title("Trading Strategy Backtester with Neural Network Exit Timing")
 
     st.sidebar.header("Configuration")
-    start_date = st.sidebar.date_input("Start Date", datetime.date(2023, 1, 1))
-    end_date = st.sidebar.date_input("End Date", datetime.date(2024, 1, 1))
+    start_date = st.sidebar.date_input("Start Date", date(2023, 1, 1))
+    end_date = st.sidebar.date_input("End Date", date(2024, 1, 1))
     exit_days = st.sidebar.slider("Exit Countdown Days", 1, 30, 5)
     use_nn = st.sidebar.checkbox("Use Neural Network for Exit Timing", True)
     selected_asset = st.sidebar.selectbox("Select Asset", list(assets.keys()))
@@ -512,14 +507,18 @@ def main():
                 return
 
             cot_df = fetch_cot_data(selected_asset)
+            if cot_df.empty:
+                st.warning(f"No COT data for {selected_asset}, using price data only.")
 
+            # Neural network training
             exit_model, feature_scaler, target_scaler = None, None, None
             if use_nn and len(price_df) > 100:
                 st.info("Training neural network for exit timing...")
                 exit_model, feature_scaler, target_scaler = train_exit_model(price_df.copy(), epochs=30)
                 st.success("Neural network trained successfully!")
 
-            results = backtest_strategy_with_nn(
+            # Run backtest
+            backtest_results = backtest_strategy_with_nn(
                 price_df,
                 cot_df if not cot_df.empty else pd.DataFrame(),
                 exit_model=exit_model,
@@ -528,18 +527,57 @@ def main():
                 exit_days=exit_days
             )
 
-            st.subheader("Performance Metrics")
-            metrics = calculate_metrics(results)
-            for k, v in metrics.items():
-                st.write(f"{k}: {v:.2%}" if isinstance(v, float) else f"{k}: {v}")
+            # Display metrics
+            metrics = calculate_metrics(backtest_results)
+            st.subheader("Backtest Results")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.write("### Performance Metrics")
+                for k, v in metrics.items():
+                    st.write(f"{k}: {v:.2%}" if isinstance(v, float) else f"{k}: {v}")
+            with col2:
+                st.write("### Position Summary")
+                position_counts = backtest_results["position"].value_counts()
+                st.write(f"Long Positions: {position_counts.get(1,0)}")
+                st.write(f"Short Positions: {position_counts.get(-1,0)}")
+                st.write(f"Neutral Positions: {position_counts.get(0,0)}")
 
+            # Plot equity curve
             st.subheader("Equity Curve")
-            plot_equity(results, symbol)
+            plot_equity(backtest_results, symbol)
 
-            st.subheader("Positions Overview")
-            st.dataframe(results[["date", "close", "position", "exit_countdown"]].tail(50))
+            # Plot positions
+            st.subheader("Positions and Signals")
+            fig, ax = plt.subplots(figsize=(12,6))
+            ax.plot(backtest_results["date"], backtest_results["close"], label="Price")
+            ax.scatter(backtest_results.loc[backtest_results["position"]==1, "date"],
+                       backtest_results.loc[backtest_results["position"]==1, "close"],
+                       color="green", label="Long", marker="^")
+            ax.scatter(backtest_results.loc[backtest_results["position"]==-1, "date"],
+                       backtest_results.loc[backtest_results["position"]==-1, "close"],
+                       color="red", label="Short", marker="v")
+            ax.scatter(backtest_results.loc[(backtest_results["position"].shift(1)!=0) & (backtest_results["position"]==0), "date"],
+                       backtest_results.loc[(backtest_results["position"].shift(1)!=0) & (backtest_results["position"]==0), "close"],
+                       color="black", label="Exit", marker="x")
+            ax.set_title(f"Positions for {symbol}")
+            ax.set_xlabel("Date")
+            ax.set_ylabel("Price")
+            ax.legend()
+            ax.grid(True)
+            st.pyplot(fig)
 
-# --- Execute main ---
+            # Exit countdown histogram
+            if "exit_countdown" in backtest_results.columns:
+                non_zero_countdowns = backtest_results[backtest_results["exit_countdown"]>0]["exit_countdown"]
+                if len(non_zero_countdowns) > 0:
+                    st.subheader("Exit Countdown Distribution")
+                    fig, ax = plt.subplots(figsize=(10,4))
+                    ax.hist(non_zero_countdowns, bins=range(1, exit_days+2), alpha=0.7)
+                    ax.set_xlabel("Days until exit")
+                    ax.set_ylabel("Frequency")
+                    ax.set_title("Distribution of Exit Countdown Values")
+                    ax.grid(True)
+                    st.pyplot(fig)
+
 if __name__ == "__main__":
     main()
-# ===== End Chunk 3/3 =====
