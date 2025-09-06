@@ -874,14 +874,14 @@ def main():
                     sell_dates = merged_data.loc[merged_data['date'].isin(sell_points), 'date']
                     ax2.scatter(sell_dates, sell_prices, marker='v', color='r', s=100)
                 
-                ax2.set_xlabel('Date')
-                ax2.set_ylabel('Price')
-                ax2.grid(True)
+                    ax2.set_xlabel('Date')
+                    ax2.set_ylabel('Price')
+                    ax2.grid(True)
                 
-                plt.tight_layout()
-                st.pyplot(fig)
-            else:
-                st.warning("No health gauge or signal data available.")
+                    plt.tight_layout()
+                    st.pyplot(fig)
+                else:
+                    st.warning("No health gauge or signal data available.")
             
             # Trade Analysis
             st.subheader("Trade Analysis")
