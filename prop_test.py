@@ -157,6 +157,7 @@ def fetch_cot_data(market_name:str,max_attempts:int=3)->pd.DataFrame:
     logger.error(f"Failed to fetch COT for {market_name} after {max_attempts} attempts.")
     return pd.DataFrame()
 
+
 # --- Price & Volume Fetching ---
 def fetch_price_data(ticker:str,years:int=3)->pd.DataFrame:
     try:
