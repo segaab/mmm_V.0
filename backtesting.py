@@ -74,52 +74,18 @@ def fetch_cot_data(market_name: str, max_attempts: int = 3) -> pd.DataFrame:
                 limit=1500
             )
             if not results:
-                logger.warning(f"No COT data found for {market_name}")
                 return pd.DataFrame()
-                
             df = pd.DataFrame.from_records(results)
-            
-            # Ensure required columns exist or create them
-            if "report_date_as_yyyy_mm_dd" in df.columns:
-                df["report_date"] = pd.to_datetime(df["report_date_as_yyyy_mm_dd"], errors="coerce")
-            else:
-                logger.warning(f"Missing report_date_as_yyyy_mm_dd column in COT data for {market_name}")
-                df["report_date"] = pd.NaT
-                
-            # Create commercial_net column
-            if "commercial_long_all" in df.columns and "commercial_short_all" in df.columns:
-                df["commercial_long_all"] = pd.to_numeric(df["commercial_long_all"], errors="coerce")
-                df["commercial_short_all"] = pd.to_numeric(df["commercial_short_all"], errors="coerce")
-                df["commercial_net"] = df["commercial_long_all"] - df["commercial_short_all"]
-            else:
-                logger.warning(f"Missing commercial long/short columns in COT data for {market_name}")
-                df["commercial_net"] = np.nan
-                
-            # Create non_commercial_net column
-            if "non_commercial_long_all" in df.columns and "non_commercial_short_all" in df.columns:
-                df["non_commercial_long_all"] = pd.to_numeric(df["non_commercial_long_all"], errors="coerce")
-                df["non_commercial_short_all"] = pd.to_numeric(df["non_commercial_short_all"], errors="coerce")
-                df["non_commercial_net"] = df["non_commercial_long_all"] - df["non_commercial_short_all"]
-            else:
-                logger.warning(f"Missing non-commercial long/short columns in COT data for {market_name}")
-                df["non_commercial_net"] = np.nan
-                
-            # Convert open interest
-            if "open_interest_all" in df.columns:
-                df["open_interest_all"] = pd.to_numeric(df["open_interest_all"], errors="coerce")
-            else:
-                logger.warning(f"Missing open_interest_all column in COT data for {market_name}")
-                df["open_interest_all"] = np.nan
-                
+            df["report_date"] = pd.to_datetime(df.get("report_date_as_yyyy_mm_dd", pd.NaT), errors="coerce")
+            df["commercial_net"] = pd.to_numeric(df.get("commercial_long_all", 0), errors="coerce") - pd.to_numeric(df.get("commercial_short_all", 0), errors="coerce")
+            df["non_commercial_net"] = pd.to_numeric(df.get("non_commercial_long_all", 0), errors="coerce") - pd.to_numeric(df.get("non_commercial_short_all", 0), errors="coerce")
+            df["open_interest_all"] = pd.to_numeric(df.get("open_interest_all", 0), errors="coerce")
             return df.sort_values("report_date").reset_index(drop=True)
         except Exception as e:
-            logger.error(f"Error fetching COT for {market_name}: {e}")
+            logger.error("Error fetching COT for %s: %s", market_name, e)
             attempt += 1
-            time.sleep(1)  # Add a small delay before retrying
-            
-    logger.error(f"Failed to fetch COT for {market_name} after {max_attempts} attempts.")
+    logger.error("Failed to fetch COT for %s after %d attempts.", market_name, max_attempts)
     return pd.DataFrame()
-
 
 # --- Fetch price data ---
 def fetch_price_data_yahoo(ticker: str, start_date: str, end_date: str, max_attempts: int = 3) -> pd.DataFrame:
@@ -177,56 +143,10 @@ def merge_cot_price(cot_df: pd.DataFrame, price_df: pd.DataFrame) -> pd.DataFram
         merged[col] = merged[col].ffill()
     return merged
 
-def merge_cot_price(cot_df: pd.DataFrame, price_df: pd.DataFrame) -> pd.DataFrame:
-    if cot_df.empty or price_df.empty:
-        logger.warning("Empty COT or price data, cannot merge")
-        return pd.DataFrame()
-        
-    # Ensure required columns exist
-    required_cot_cols = ["report_date", "open_interest_all", "commercial_net", "non_commercial_net"]
-    for col in required_cot_cols:
-        if col not in cot_df.columns:
-            logger.warning(f"Missing required column {col} in COT data")
-            cot_df[col] = np.nan
-            
-    cot_small = cot_df[required_cot_cols].copy()
-    cot_small.rename(columns={"report_date": "date"}, inplace=True)
-    
-    # Ensure date columns are datetime
-    price_df["date"] = pd.to_datetime(price_df["date"])
-    cot_small["date"] = pd.to_datetime(cot_small["date"])
-    
-    # Merge with backward filling of COT data (since it's weekly)
-    merged = pd.merge_asof(
-        price_df.sort_values("date"),
-        cot_small.sort_values("date"),
-        on="date",
-        direction="backward"
-    )
-    
-    # Forward fill COT columns
-    for col in ["open_interest_all", "commercial_net", "non_commercial_net"]:
-        merged[col] = merged[col].ffill()
-        
-    return merged
-
-
 # --- Calculate Health Gauge ---
 def calculate_health_gauge(cot_df: pd.DataFrame, price_df: pd.DataFrame) -> float:
     if cot_df.empty or price_df.empty:
         return float("nan")
-    
-    # Make sure required columns exist
-    if "commercial_net" not in cot_df.columns:
-        logger.warning("commercial_net column missing in COT data")
-        return float("nan")
-    if "non_commercial_net" not in cot_df.columns:
-        logger.warning("non_commercial_net column missing in COT data")
-        return float("nan")
-    if "open_interest_all" not in price_df.columns:
-        logger.warning("open_interest_all column missing in merged data")
-        return float("nan")
-        
     df = price_df.copy()
     df["rvol"] = df.get("rvol", np.nan)
     last_date = df["date"].max()
@@ -240,25 +160,10 @@ def calculate_health_gauge(cot_df: pd.DataFrame, price_df: pd.DataFrame) -> floa
     # COT analytics (35%)
     commercial = cot_df[["report_date", "commercial_net"]].dropna(subset=["commercial_net"])
     non_commercial = cot_df[["report_date", "non_commercial_net"]].dropna(subset=["non_commercial_net"])
-    
-    # Ensure data exists for short and long term analysis
-    short_term = commercial[commercial["report_date"] >= three_months_ago] if not commercial.empty else pd.DataFrame()
-    long_term = non_commercial[non_commercial["report_date"] >= one_year_ago] if not non_commercial.empty else pd.DataFrame()
-    
-    st_score = 0.0
-    if not short_term.empty and len(short_term) > 1:
-        min_val = short_term["commercial_net"].min()
-        max_val = short_term["commercial_net"].max()
-        if max_val > min_val:
-            st_score = float((short_term["commercial_net"].iloc[-1] - min_val) / (max_val - min_val))
-    
-    lt_score = 0.0
-    if not long_term.empty and len(long_term) > 1:
-        min_val = long_term["non_commercial_net"].min()
-        max_val = long_term["non_commercial_net"].max()
-        if max_val > min_val:
-            lt_score = float((long_term["non_commercial_net"].iloc[-1] - min_val) / (max_val - min_val))
-    
+    short_term = commercial[commercial["report_date"] >= three_months_ago]
+    long_term = non_commercial[non_commercial["report_date"] >= one_year_ago]
+    st_score = float((short_term["commercial_net"].iloc[-1] - short_term["commercial_net"].min()) / (short_term["commercial_net"].max() - short_term["commercial_net"].min() + 1e-9)) if not short_term.empty else 0.0
+    lt_score = float((long_term["non_commercial_net"].iloc[-1] - long_term["non_commercial_net"].min()) / (long_term["non_commercial_net"].max() - long_term["non_commercial_net"].min() + 1e-9)) if not long_term.empty else 0.0
     cot_score = 0.4 * st_score + 0.6 * lt_score
 
     # Price + RVol score (40%)
@@ -279,27 +184,19 @@ def calculate_health_gauge(cot_df: pd.DataFrame, price_df: pd.DataFrame) -> floa
 
     return (0.25 * oi_score + 0.35 * cot_score + 0.4 * pv_score) * 10.0
 
-
 # --- Generate signals ---
 def generate_signals(df, buy_threshold=0.3, sell_threshold=0.7):
-    if df is None or df.empty:
-        return pd.DataFrame()
+    if df.empty:
+        return df
 
     health_gauges = []
     for i in range(len(df)):
         date = df.iloc[i]["date"]
-        # Get data up to and including current date
         cot_subset = df[df["date"] <= date].copy()
         price_subset = df[df["date"] <= date].copy()
-        
-        # Calculate health gauge if we have data
-        if not cot_subset.empty and not price_subset.empty and "commercial_net" in df.columns and "non_commercial_net" in df.columns:
-            hg = calculate_health_gauge(cot_subset, price_subset)
-        else:
-            hg = np.nan
+        hg = calculate_health_gauge(cot_subset, price_subset) if not cot_subset.empty and not price_subset.empty else np.nan
         health_gauges.append(hg)
 
-    df = df.copy()  # Create a copy to avoid SettingWithCopyWarning
     df["hg"] = health_gauges
     df["hg"] = df["hg"].fillna(0).clip(0, 10) / 10
 
@@ -308,7 +205,6 @@ def generate_signals(df, buy_threshold=0.3, sell_threshold=0.7):
     df.loc[df["hg"] < buy_threshold, "signal"] = 1
 
     return df
-
 
 # --- Helper Functions for Backtesting ---
 def load_price_data(asset_name, years_back):
