@@ -60,6 +60,7 @@ st.markdown("""
 </style>  
 """, unsafe_allow_html=True)
 
+
 # --- Risk Profiles for Prop Firms ---
 RISK_PROFILES = {
     "QT Prime 2-Step": {
