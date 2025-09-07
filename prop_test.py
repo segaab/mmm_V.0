@@ -12,10 +12,7 @@ from yahooquery import Ticker
 from datetime import timedelta
 
 # --- Logging ---
-logging.basicConfig(level=logg
-
-
-ing.INFO)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # --- Streamlit Page ---
@@ -148,7 +145,6 @@ assets = {
     "CRUDE OIL, LIGHT SWEET - NEW YORK MERCANTILE EXCHANGE": "CL=F",
     "NATURAL GAS - NEW YORK MERCANTILE EXCHANGE": "NG=F",
 }
-
 
 # --- Contract sizes per asset class ---
 CONTRACT_SIZES = {
