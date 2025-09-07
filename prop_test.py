@@ -461,4 +461,52 @@ def main():
         cot_df = load_cot_data(selected_asset)
 
         if price_df.empty or cot_df.empty:
-            st.error(f"No data available for {selected_a
+            st.error(f"No data available for {selected_asset}. Please try another asset.")
+            return
+
+        price_df = calculate_rvol(price_df)
+        signals_df = merge_cot_price(cot_df, price_df)
+        signals_df = generate_signals(signals_df, buy_threshold=buy_thresh, sell_threshold=sell_thresh)
+
+    equity_df, trades_df, metrics = execute_backtest(
+        signals_df,
+        asset_name=selected_asset,
+        starting_balance=starting_balance,
+        leverage=leverage,
+        lot_size=lot_size,
+        exit_rr=exit_rr,
+        rr_percent=rr_percent,
+        stop_loss_pips=stop_loss_pips,
+        margin_alloc_pct=margin_alloc_pct,
+        maintenance_margin_pct=maintenance_margin_pct
+    )
+
+    st.subheader("Backtest Metrics")
+    st.write(metrics)
+
+    if not equity_df.empty:
+        st.subheader("Equity Curve")
+        fig, ax = plt.subplots()
+        ax.plot(equity_df["date"], equity_df["balance"], label="Equity Curve")
+        ax.set_xlabel("Date")
+        ax.set_ylabel("Balance")
+        ax.legend()
+        st.pyplot(fig)
+
+    if not signals_df.empty and "hg" in signals_df.columns:
+        st.subheader("Health Gauge Over Time")
+        fig, ax = plt.subplots()
+        ax.plot(signals_df["date"], signals_df["hg"], label="Health Gauge")
+        ax.axhline(y=buy_thresh, color='g', linestyle='--', label=f"Buy Threshold ({buy_thresh})")
+        ax.axhline(y=sell_thresh, color='r', linestyle='--', label=f"Sell Threshold ({sell_thresh})")
+        ax.set_xlabel("Date")
+        ax.set_ylabel("Health Gauge Value")
+        ax.legend()
+        st.pyplot(fig)
+
+    if not trades_df.empty:
+        st.subheader("Trades Executed")
+        st.dataframe(trades_df)
+
+if __name__ == "__main__":
+    main()
