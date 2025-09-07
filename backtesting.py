@@ -205,3 +205,217 @@ def generate_signals(df, buy_threshold=0.3, sell_threshold=0.7):
     df.loc[df["hg"] < buy_threshold, "signal"] = 1
 
     return df
+
+# --- Helper Functions for Backtesting ---
+def load_price_data(asset_name, years_back):
+    ticker = assets.get(asset_name)
+    if ticker is None:
+        logger.warning(f"No ticker mapping found for {asset_name}.")
+        return pd.DataFrame()
+    end_date = datetime.datetime.today()
+    start_date = end_date - datetime.timedelta(days=years_back * 365)
+    return fetch_price_data_yahoo(ticker, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
+
+def load_cot_data(asset_name):
+    return fetch_cot_data(asset_name)
+
+def process_data_for_backtesting(asset_name, years_back):
+    price_df = load_price_data(asset_name, years_back)
+    cot_df = load_cot_data(asset_name)
+
+    if price_df.empty or cot_df.empty:
+        return pd.DataFrame()
+
+    price_df = calculate_rvol(price_df)
+    merged_df = merge_cot_price(cot_df, price_df)
+    signals_df = generate_signals(merged_df)
+    return signals_df
+
+# --- Position Size Calculation ---
+def calculate_position_size(account_balance, risk_percent, leverage, stop_loss_pips, 
+                           asset_name, price, margin_alloc_pct=0.5, 
+                           maintenance_margin_pct=0.1, min_lot=0.01, lot_step=0.01,
+                           max_effective_leverage=None, max_total_exposure_pct=None):
+    try:
+        asset_class, symbol = asset_classes.get(asset_name, ("FX", "default"))
+    except:
+        logger.warning(f"Unknown asset: {asset_name}, using FX default")
+        asset_class, symbol = "FX", "default"
+
+    contract_size = get_contract_size(asset_class, symbol)
+    
+    pip_size = 0.01 if asset_class != "FX" else 0.0001
+    position_value_per_lot = contract_size * price
+    margin_per_lot = position_value_per_lot / leverage
+
+    available_margin = account_balance * margin_alloc_pct * (1 - maintenance_margin_pct)
+    if available_margin <= 0:
+        return 0.0
+
+    max_lots_margin = available_margin / margin_per_lot
+    loss_per_lot = contract_size * pip_size * stop_loss_pips
+    max_lots_risk = (account_balance * risk_percent) / loss_per_lot if loss_per_lot > 0 else float("inf")
+
+    raw_lots = min(max_lots_margin, max_lots_risk)
+
+    if max_total_exposure_pct is not None:
+        max_value_allowed = account_balance * max_total_exposure_pct
+        max_lots_exposure = max_value_allowed / position_value_per_lot
+        raw_lots = min(raw_lots, max_lots_exposure)
+
+    if max_effective_leverage is not None and max_effective_leverage > 0:
+        max_total_value = account_balance * max_effective_leverage
+        max_lots_efflev = max_total_value / position_value_per_lot
+        raw_lots = min(raw_lots, max_lots_efflev)
+
+    steps = np.floor(raw_lots / lot_step)
+    lots = max(0.0, steps * lot_step)
+    if lots < min_lot:
+        lots = 0.0
+
+    return lots
+
+# --- Execute Backtest ---
+def execute_backtest(signals_df: pd.DataFrame, asset_name: str, starting_balance=10000, leverage=15,
+                     lot_size=1.0, exit_rr=2.0, rr_percent=0.1, stop_loss_pips=50,
+                     margin_alloc_pct=0.5, maintenance_margin_pct=0.1):
+    if signals_df.empty:
+        return pd.DataFrame(), pd.DataFrame(), {}
+
+    balance = starting_balance
+    equity_curve = []
+    trades = []
+
+    for i in range(1, len(signals_df)):
+        signal = signals_df.iloc[i-1].get("signal", 0)
+        price_open = signals_df.iloc[i].get("close", np.nan)
+        price_prev = signals_df.iloc[i-1].get("close", np.nan)
+
+        if signal != 0 and not np.isnan(price_open) and not np.isnan(price_prev):
+            position_lots = calculate_position_size(
+                account_balance=balance,
+                risk_percent=rr_percent,
+                leverage=leverage,
+                stop_loss_pips=stop_loss_pips,
+                asset_name=asset_name,
+                price=price_open,
+                margin_alloc_pct=margin_alloc_pct,
+                maintenance_margin_pct=maintenance_margin_pct
+            ) * lot_size
+
+            trade_return = ((price_open - price_prev) / price_prev) * leverage * signal * position_lots
+            balance += balance * rr_percent * trade_return
+            rr_actual = trade_return / exit_rr if exit_rr != 0 else 0
+            trades.append({
+                "date": signals_df.iloc[i]["date"],
+                "signal": signal,
+                "price": price_open,
+                "position_lots": position_lots,
+                "trade_return": trade_return,
+                "rr_actual": rr_actual,
+                "balance": balance
+            })
+
+        equity_curve.append({"date": signals_df.iloc[i]["date"], "balance": balance})
+
+    equity_df = pd.DataFrame(equity_curve)
+    trades_df = pd.DataFrame(trades)
+
+    wins = trades_df[trades_df["trade_return"] > 0].shape[0] if not trades_df.empty else 0
+    losses = trades_df[trades_df["trade_return"] <= 0].shape[0] if not trades_df.empty else 0
+    win_rate = wins / (wins + losses) if (wins + losses) > 0 else 0
+    average_rr = trades_df["rr_actual"].mean() if not trades_df.empty else 0
+    max_rr = trades_df["rr_actual"].max() if not trades_df.empty else 0
+    min_rr = trades_df["rr_actual"].min() if not trades_df.empty else 0
+
+    metrics = {
+        "final_balance": balance,
+        "total_return": (balance - starting_balance) / starting_balance,
+        "num_trades": len(trades_df),
+        "wins": wins,
+        "losses": losses,
+        "win_rate": win_rate,
+        "average_rr": average_rr,
+        "max_rr": max_rr,
+        "min_rr": min_rr
+    }
+
+    return equity_df, trades_df, metrics
+
+# --- Streamlit Interface ---
+def main():
+    st.title("Health Gauge Trading Strategy Backtester")
+
+    with st.sidebar:
+        st.header("Backtest Parameters")
+
+        selected_asset = st.selectbox("Select Asset", list(assets.keys()), index=0)
+        years_back = st.slider("Years to Backtest", min_value=1, max_value=10, value=3)
+
+        buy_thresh = st.number_input("Buy Threshold", min_value=0.0, max_value=1.0, value=0.3, step=0.05)
+        sell_thresh = st.number_input("Sell Threshold", min_value=0.0, max_value=1.0, value=0.7, step=0.05)
+
+        lot_size = st.number_input("Lot Size Multiplier", min_value=0.01, value=1.0, step=0.01)
+        exit_rr = st.number_input("Exit RR", min_value=0.1, value=2.0, step=0.1)
+        rr_percent = st.number_input("RR % of Capital per Trade", min_value=0.01, max_value=1.0, value=0.1, step=0.01)
+        stop_loss_pips = st.number_input("Stop Loss (pips)", min_value=1, value=50, step=1)
+        starting_balance = st.number_input("Starting Balance", min_value=1000, value=10000, step=1000)
+        leverage = st.number_input("Leverage", min_value=1, value=15, step=1)
+        
+        margin_alloc_pct = st.slider("Margin Allocation %", min_value=0.1, max_value=1.0, value=0.5, step=0.1)
+        maintenance_margin_pct = st.slider("Maintenance Margin %", min_value=0.05, max_value=0.5, value=0.1, step=0.05)
+
+    with st.spinner("Loading and processing data..."):
+        price_df = load_price_data(selected_asset, years_back)
+        cot_df = load_cot_data(selected_asset)
+
+        if price_df.empty or cot_df.empty:
+            st.error(f"No data available for {selected_asset}. Please try another asset.")
+            return
+
+        price_df = calculate_rvol(price_df)
+        signals_df = merge_cot_price(cot_df, price_df)
+        signals_df = generate_signals(signals_df, buy_threshold=buy_thresh, sell_threshold=sell_thresh)
+
+    equity_df, trades_df, metrics = execute_backtest(
+        signals_df,
+        asset_name=selected_asset,
+        starting_balance=starting_balance,
+        leverage=leverage,
+        lot_size=lot_size,
+        exit_rr=exit_rr,
+        rr_percent=rr_percent,
+        stop_loss_pips=stop_loss_pips,
+        margin_alloc_pct=margin_alloc_pct,
+        maintenance_margin_pct=maintenance_margin_pct
+    )
+
+    st.subheader("Backtest Metrics")
+    st.write(metrics)
+
+    if not equity_df.empty:
+        st.subheader("Equity Curve")
+        fig, ax = plt.subplots()
+        ax.plot(equity_df["date"], equity_df["balance"], label="Equity Curve")
+        ax.set_xlabel("Date")
+        ax.set_ylabel("Balance")
+        ax.legend()
+        st.pyplot(fig)
+
+    if not signals_df.empty and "hg" in signals_df.columns:
+        st.subheader("Health Gauge Over Time")
+        fig, ax = plt.subplots()
+        ax.plot(signals_df["date"], signals_df["hg"], label="Health Gauge")
+        ax.axhline(y=buy_thresh, color='g', linestyle='--', label=f"Buy Threshold ({buy_thresh})")
+        ax.axhline(y=sell_thresh, color='r', linestyle='--', label=f"Sell Threshold ({sell_thresh})")
+        ax.set_xlabel("Date")
+        ax.set_ylabel("Health Gauge Value")
+        ax.legend()
+        st.pyplot(fig)
+
+    if not trades_df.empty:
+        st.subheader("Trades Executed")
+        st.dataframe(trades_df)
+
+if __name__ == "__main__":
+    main()
