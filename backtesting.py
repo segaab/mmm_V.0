@@ -198,7 +198,11 @@ def merge_cot_price(cot_df: pd.DataFrame, price_df: pd.DataFrame) -> pd.DataFram
 def calculate_health_gauge(cot_df: pd.DataFrame, price_df: pd.DataFrame) -> float:
     if cot_df.empty or price_df.empty:
         return float("nan")
-    
+
+    # Rename 'date' to 'report_date' if 'report_date' is missing
+    if "report_date" not in cot_df.columns and "date" in cot_df.columns:
+        cot_df = cot_df.rename(columns={"date": "report_date"})
+
     # Make sure required columns exist
     if "commercial_net" not in cot_df.columns:
         logger.warning("commercial_net column missing in COT data")
@@ -209,7 +213,8 @@ def calculate_health_gauge(cot_df: pd.DataFrame, price_df: pd.DataFrame) -> floa
     if "open_interest_all" not in price_df.columns:
         logger.warning("open_interest_all column missing in merged data")
         return float("nan")
-        
+    
+    # Rest of the function remains exactly as in your script...
     df = price_df.copy()
     df["rvol"] = df.get("rvol", np.nan)
     last_date = df["date"].max()
@@ -223,25 +228,24 @@ def calculate_health_gauge(cot_df: pd.DataFrame, price_df: pd.DataFrame) -> floa
     # COT analytics (35%)
     commercial = cot_df[["report_date", "commercial_net"]].dropna(subset=["commercial_net"])
     non_commercial = cot_df[["report_date", "non_commercial_net"]].dropna(subset=["non_commercial_net"])
-    
-    # Ensure data exists for short and long term analysis
+
     short_term = commercial[commercial["report_date"] >= three_months_ago] if not commercial.empty else pd.DataFrame()
     long_term = non_commercial[non_commercial["report_date"] >= one_year_ago] if not non_commercial.empty else pd.DataFrame()
-    
+
     st_score = 0.0
     if not short_term.empty and len(short_term) > 1:
         min_val = short_term["commercial_net"].min()
         max_val = short_term["commercial_net"].max()
         if max_val > min_val:
             st_score = float((short_term["commercial_net"].iloc[-1] - min_val) / (max_val - min_val))
-    
+
     lt_score = 0.0
     if not long_term.empty and len(long_term) > 1:
         min_val = long_term["non_commercial_net"].min()
         max_val = long_term["non_commercial_net"].max()
         if max_val > min_val:
             lt_score = float((long_term["non_commercial_net"].iloc[-1] - min_val) / (max_val - min_val))
-    
+
     cot_score = 0.4 * st_score + 0.6 * lt_score
 
     # Price + RVol score (40%)
