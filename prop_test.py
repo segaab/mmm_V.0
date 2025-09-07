@@ -1,4 +1,4 @@
-import streamlit as st
+noimport streamlit as st
 import pandas as pd
 import numpy as np
 import datetime
@@ -323,66 +323,118 @@ def process_data_for_backtesting(asset_name, years_back):
     return signals_df
 
 # --- Position Size Calculation ---
+# --- Position Size Calculation with Updated Risk Rules ---
 def calculate_position_size(account_balance, risk_percent, leverage, stop_loss_pips, 
-                           asset_name, price, margin_alloc_pct=0.5, 
-                           maintenance_margin_pct=0.1, min_lot=0.01, lot_step=0.01,
-                           max_effective_leverage=None, max_total_exposure_pct=None):
+                           asset_name, price, margin_alloc_pct=0.4, 
+                           maintenance_margin_pct=0.15, min_lot=0.01, lot_step=0.01):
     try:
         asset_class, symbol = asset_classes.get(asset_name, ("FX", "default"))
     except:
         logger.warning(f"Unknown asset: {asset_name}, using FX default")
         asset_class, symbol = "FX", "default"
 
+    # Set maximum effective leverage based on asset class
+    if asset_class == "FX":
+        max_effective_leverage = 30
+    elif asset_class in ["METALS", "OIL", "INDICES"]:
+        max_effective_leverage = 10
+    else:
+        max_effective_leverage = 10
+
+    # Maximum exposure per symbol (20% as per TopOneTrader rule)
+    max_total_exposure_pct = 0.20
+
+    # Maximum risk per trade (2% as per prop firm rules)
+    risk_percent = min(risk_percent, 0.02)
+
     contract_size = get_contract_size(asset_class, symbol)
-    
     pip_size = 0.01 if asset_class != "FX" else 0.0001
     position_value_per_lot = contract_size * price
     margin_per_lot = position_value_per_lot / leverage
 
+    # Calculate available margin with updated parameters
     available_margin = account_balance * margin_alloc_pct * (1 - maintenance_margin_pct)
     if available_margin <= 0:
         return 0.0
 
+    # Calculate maximum lots based on various constraints
     max_lots_margin = available_margin / margin_per_lot
     loss_per_lot = contract_size * pip_size * stop_loss_pips
     max_lots_risk = (account_balance * risk_percent) / loss_per_lot if loss_per_lot > 0 else float("inf")
 
-    raw_lots = min(max_lots_margin, max_lots_risk)
+    # Apply maximum exposure limit
+    max_value_allowed = account_balance * max_total_exposure_pct
+    max_lots_exposure = max_value_allowed / position_value_per_lot
 
-    if max_total_exposure_pct is not None:
-        max_value_allowed = account_balance * max_total_exposure_pct
-        max_lots_exposure = max_value_allowed / position_value_per_lot
-        raw_lots = min(raw_lots, max_lots_exposure)
+    # Apply maximum effective leverage limit
+    max_total_value = account_balance * max_effective_leverage
+    max_lots_efflev = max_total_value / position_value_per_lot
 
-    if max_effective_leverage is not None and max_effective_leverage > 0:
-        max_total_value = account_balance * max_effective_leverage
-        max_lots_efflev = max_total_value / position_value_per_lot
-        raw_lots = min(raw_lots, max_lots_efflev)
+    # Take minimum of all constraints
+    raw_lots = min(max_lots_margin, max_lots_risk, max_lots_exposure, max_lots_efflev)
 
+    # Round to nearest lot step
     steps = np.floor(raw_lots / lot_step)
     lots = max(0.0, steps * lot_step)
+    
+    # Apply minimum lot size
     if lots < min_lot:
         lots = 0.0
 
     return lots
 
+# --- Daily Loss Limit Check ---
+def check_daily_loss_limit(current_balance, starting_daily_balance):
+    daily_loss_pct = (starting_daily_balance - current_balance) / starting_daily_balance
+    return daily_loss_pct <= 0.04  # Using QT Prime's stricter 4% daily limit
+
 # --- Execute Backtest ---
 def execute_backtest(signals_df: pd.DataFrame, asset_name: str, starting_balance=10000, leverage=15,
-                     lot_size=1.0, exit_rr=2.0, rr_percent=0.1, stop_loss_pips=50,
-                     margin_alloc_pct=0.5, maintenance_margin_pct=0.1):
+                     lot_size=1.0, exit_rr=2.0, rr_percent=0.02, stop_loss_pips=50,
+                     margin_alloc_pct=0.4, maintenance_margin_pct=0.15):
     if signals_df.empty:
         return pd.DataFrame(), pd.DataFrame(), {}
 
     balance = starting_balance
     equity_curve = []
     trades = []
+    
+    # Initialize tracking variables
+    daily_starting_balance = starting_balance
+    current_date = None
+    max_drawdown = 0
+    peak_balance = starting_balance
+    open_positions = []
+    total_exposure = 0
 
     for i in range(1, len(signals_df)):
+        current_row = signals_df.iloc[i]
+        
+        # Reset daily tracking on new day
+        if current_row["date"].date() != current_date:
+            daily_starting_balance = balance
+            current_date = current_row["date"].date()
+            
+        # Check daily loss limit
+        daily_loss_pct = (daily_starting_balance - balance) / daily_starting_balance
+        if daily_loss_pct >= 0.04:  # QT Prime's 4% daily loss limit
+            continue
+            
+        # Check maximum drawdown
+        if balance > peak_balance:
+            peak_balance = balance
+        current_drawdown = (peak_balance - balance) / peak_balance
+        if current_drawdown > max_drawdown:
+            max_drawdown = current_drawdown
+        if current_drawdown >= 0.10:  # 10% maximum drawdown limit
+            break
+
         signal = signals_df.iloc[i-1].get("signal", 0)
-        price_open = signals_df.iloc[i].get("close", np.nan)
+        price_open = current_row.get("close", np.nan)
         price_prev = signals_df.iloc[i-1].get("close", np.nan)
 
         if signal != 0 and not np.isnan(price_open) and not np.isnan(price_prev):
+            # Calculate position size with updated risk parameters
             position_lots = calculate_position_size(
                 account_balance=balance,
                 risk_percent=rr_percent,
@@ -394,24 +446,38 @@ def execute_backtest(signals_df: pd.DataFrame, asset_name: str, starting_balance
                 maintenance_margin_pct=maintenance_margin_pct
             ) * lot_size
 
+            # Calculate trade metrics
             trade_return = ((price_open - price_prev) / price_prev) * leverage * signal * position_lots
-            balance += balance * rr_percent * trade_return
-            rr_actual = trade_return / exit_rr if exit_rr != 0 else 0
-            trades.append({
-                "date": signals_df.iloc[i]["date"],
-                "signal": signal,
-                "price": price_open,
-                "position_lots": position_lots,
-                "trade_return": trade_return,
-                "rr_actual": rr_actual,
-                "balance": balance
-            })
+            new_balance = balance + (balance * rr_percent * trade_return)
+            
+            # Only execute trade if it doesn't breach risk limits
+            if position_lots > 0 and new_balance >= balance * 0.96:  # Respect 4% daily loss limit
+                balance = new_balance
+                rr_actual = trade_return / exit_rr if exit_rr != 0 else 0
+                
+                trades.append({
+                    "date": current_row["date"],
+                    "signal": signal,
+                    "price": price_open,
+                    "position_lots": position_lots,
+                    "trade_return": trade_return,
+                    "rr_actual": rr_actual,
+                    "balance": balance,
+                    "drawdown": current_drawdown,
+                    "daily_loss": daily_loss_pct
+                })
 
-        equity_curve.append({"date": signals_df.iloc[i]["date"], "balance": balance})
+        equity_curve.append({
+            "date": current_row["date"], 
+            "balance": balance,
+            "drawdown": current_drawdown,
+            "daily_loss": daily_loss_pct
+        })
 
     equity_df = pd.DataFrame(equity_curve)
     trades_df = pd.DataFrame(trades)
 
+    # Calculate performance metrics
     wins = trades_df[trades_df["trade_return"] > 0].shape[0] if not trades_df.empty else 0
     losses = trades_df[trades_df["trade_return"] <= 0].shape[0] if not trades_df.empty else 0
     win_rate = wins / (wins + losses) if (wins + losses) > 0 else 0
@@ -428,7 +494,9 @@ def execute_backtest(signals_df: pd.DataFrame, asset_name: str, starting_balance
         "win_rate": win_rate,
         "average_rr": average_rr,
         "max_rr": max_rr,
-        "min_rr": min_rr
+        "min_rr": min_rr,
+        "max_drawdown": max_drawdown,
+        "max_daily_loss": equity_df["daily_loss"].max() if not equity_df.empty else 0
     }
 
     return equity_df, trades_df, metrics
