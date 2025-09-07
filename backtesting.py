@@ -76,7 +76,7 @@ def fetch_cot_data(market_name: str, max_attempts: int = 3) -> pd.DataFrame:
             if not results:
                 return pd.DataFrame()
             df = pd.DataFrame.from_records(results)
-            df["report_date"] = pd.to_datetime(df["report_date_as_yyyy_mm_dd"], errors="coerce")
+            df["report_date"] = pd.to_datetime(df.get("report_date_as_yyyy_mm_dd", pd.NaT), errors="coerce")
             df["commercial_net"] = pd.to_numeric(df.get("commercial_long_all", 0), errors="coerce") - pd.to_numeric(df.get("commercial_short_all", 0), errors="coerce")
             df["non_commercial_net"] = pd.to_numeric(df.get("non_commercial_long_all", 0), errors="coerce") - pd.to_numeric(df.get("non_commercial_short_all", 0), errors="coerce")
             df["open_interest_all"] = pd.to_numeric(df.get("open_interest_all", 0), errors="coerce")
@@ -107,8 +107,8 @@ def fetch_price_data_yahoo(ticker: str, start_date: str, end_date: str, max_atte
             else:
                 hist.index = pd.to_datetime(hist.index)
                 hist = hist.reset_index().rename(columns={"index": "date"})
-            hist["close"] = pd.to_numeric(hist["close"], errors="coerce")
-            hist["volume"] = pd.to_numeric(hist["volume"], errors="coerce")
+            hist["close"] = pd.to_numeric(hist.get("close", np.nan), errors="coerce")
+            hist["volume"] = pd.to_numeric(hist.get("volume", np.nan), errors="coerce")
             return hist.sort_values("date").reset_index(drop=True)
         except Exception as e:
             logger.error("Error fetching Yahoo data for %s: %s", ticker, e)
@@ -129,6 +129,9 @@ def calculate_rvol(df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
 def merge_cot_price(cot_df: pd.DataFrame, price_df: pd.DataFrame) -> pd.DataFrame:
     if cot_df.empty or price_df.empty:
         return pd.DataFrame()
+    for col in ["report_date", "open_interest_all", "commercial_net", "non_commercial_net"]:
+        if col not in cot_df.columns:
+            cot_df[col] = np.nan
     cot_small = cot_df[["report_date", "open_interest_all", "commercial_net", "non_commercial_net"]].copy()
     cot_small.rename(columns={"report_date": "date"}, inplace=True)
     price_df["date"] = pd.to_datetime(price_df["date"])
@@ -136,7 +139,6 @@ def merge_cot_price(cot_df: pd.DataFrame, price_df: pd.DataFrame) -> pd.DataFram
                            cot_small.sort_values("date"),
                            on="date",
                            direction="backward")
-    # forward-fill COT columns
     for col in ["open_interest_all", "commercial_net", "non_commercial_net"]:
         merged[col] = merged[col].ffill()
     return merged
@@ -146,6 +148,7 @@ def calculate_health_gauge(cot_df: pd.DataFrame, price_df: pd.DataFrame) -> floa
     if cot_df.empty or price_df.empty:
         return float("nan")
     df = price_df.copy()
+    df["rvol"] = df.get("rvol", np.nan)
     last_date = df["date"].max()
     one_year_ago = last_date - pd.Timedelta(days=365)
     three_months_ago = last_date - pd.Timedelta(days=90)
@@ -155,8 +158,8 @@ def calculate_health_gauge(cot_df: pd.DataFrame, price_df: pd.DataFrame) -> floa
     oi_score = float((oi_series.iloc[-1] - oi_series.min()) / (oi_series.max() - oi_series.min() + 1e-9)) if not oi_series.empty else 0.0
 
     # COT analytics (35%)
-    commercial = cot_df[["report_date", "commercial_net"]].dropna()
-    non_commercial = cot_df[["report_date", "non_commercial_net"]].dropna()
+    commercial = cot_df[["report_date", "commercial_net"]].dropna(subset=["commercial_net"])
+    non_commercial = cot_df[["report_date", "non_commercial_net"]].dropna(subset=["non_commercial_net"])
     short_term = commercial[commercial["report_date"] >= three_months_ago]
     long_term = non_commercial[non_commercial["report_date"] >= one_year_ago]
     st_score = float((short_term["commercial_net"].iloc[-1] - short_term["commercial_net"].min()) / (short_term["commercial_net"].max() - short_term["commercial_net"].min() + 1e-9)) if not short_term.empty else 0.0
@@ -165,304 +168,40 @@ def calculate_health_gauge(cot_df: pd.DataFrame, price_df: pd.DataFrame) -> floa
 
     # Price + RVol score (40%)
     recent = df[df["date"] >= three_months_ago]
-    if recent.empty or "rvol" not in recent.columns:
+    if recent.empty or "rvol" not in recent.columns or recent["rvol"].isna().all():
         pv_score = 0.0
     else:
         rvol_75 = recent["rvol"].quantile(0.75)
-        recent["vol_avg20"] = recent["volume"].rolling(20).mean()
+        recent["vol_avg20"] = recent["volume"].rolling(20, min_periods=1).mean()
         recent["vol_spike"] = recent["volume"] > recent["vol_avg20"]
         filt = recent[(recent["rvol"] >= rvol_75) & (recent["vol_spike"])]
         if filt.empty:
             pv_score = 0.0
         else:
-            last_ret = float(filt["close"].pct_change().iloc[-1])
+            last_ret = float(filt["close"].pct_change().iloc[-1]) if len(filt) > 1 else 0.0
             bucket = 5 if last_ret >= 0.02 else 4 if last_ret >= 0.01 else 3 if last_ret >= -0.01 else 2 if last_ret >= -0.02 else 1
             pv_score = (bucket - 1) / 4.0
 
     return (0.25 * oi_score + 0.35 * cot_score + 0.4 * pv_score) * 10.0
 
-# --- Helper Functions for Backtesting ---
-def load_price_data(asset_name, years_back):
-    ticker = assets[asset_name]
-    end_date = datetime.datetime.today()
-    start_date = end_date - datetime.timedelta(days=years_back*365)
-    return fetch_price_data_yahoo(ticker, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
-
-def load_cot_data(asset_name):
-    return fetch_cot_data(asset_name)
-
-def process_data_for_backtesting(asset_name, years_back):
-    price_df = load_price_data(asset_name, years_back)
-    cot_df = load_cot_data(asset_name)
-    
-    if price_df.empty or cot_df.empty:
-        return pd.DataFrame()
-    
-    # Calculate RVol
-    price_df = calculate_rvol(price_df)
-    
-    # Merge data
-    merged_df = merge_cot_price(cot_df, price_df)
-    
-    # Generate trading signals
-    signals_df = generate_signals(merged_df)
-    
-    return signals_df
-
+# --- Generate signals ---
 def generate_signals(df, buy_threshold=0.3, sell_threshold=0.7):
     if df.empty:
         return df
-    
-    # Calculate daily health gauge values
+
     health_gauges = []
     for i in range(len(df)):
         date = df.iloc[i]["date"]
         cot_subset = df[df["date"] <= date].copy()
         price_subset = df[df["date"] <= date].copy()
-        if not cot_subset.empty and not price_subset.empty:
-            hg = calculate_health_gauge(cot_subset, price_subset)
-            health_gauges.append(hg)
-        else:
-            health_gauges.append(np.nan)
-    
+        hg = calculate_health_gauge(cot_subset, price_subset) if not cot_subset.empty and not price_subset.empty else np.nan
+        health_gauges.append(hg)
+
     df["hg"] = health_gauges
-    df["hg"] = df["hg"].clip(0, 10) / 10  # Normalize to 0-1 range
-    
-    # Generate signals
+    df["hg"] = df["hg"].fillna(0).clip(0, 10) / 10
+
     df["signal"] = 0
     df.loc[df["hg"] > sell_threshold, "signal"] = -1
     df.loc[df["hg"] < buy_threshold, "signal"] = 1
-    
+
     return df
-
-# --- Position Size Calculation ---
-def calculate_position_size(account_balance, risk_percent, leverage, stop_loss_pips, 
-                           asset_name, price, margin_alloc_pct=0.5, 
-                           maintenance_margin_pct=0.1, min_lot=0.01, lot_step=0.01,
-                           max_effective_leverage=None, max_total_exposure_pct=None):
-    """
-    Calculate position size with contract size-based lot limits and multiple constraints
-    """
-    # Get asset class and symbol
-    try:
-        asset_class, symbol = asset_classes.get(asset_name, ("FX", "default"))
-    except:
-        logger.warning(f"Unknown asset: {asset_name}, using FX default")
-        asset_class, symbol = "FX", "default"
-    
-    # Get contract size
-    contract_size = get_contract_size(asset_class, symbol)
-    
-    # Determine pip size based on asset class
-    if asset_class == "FX":
-        pip_size = 0.0001
-    elif asset_class == "INDICES":
-        pip_size = 0.01
-    elif asset_class == "METALS":
-        pip_size = 0.01
-    else:  # OIL and others
-        pip_size = 0.01
-    
-    # 1. Position value & margin per lot
-    position_value_per_lot = contract_size * price
-    margin_per_lot = position_value_per_lot / leverage
-    
-    # 2. Available margin
-    available_margin = account_balance * margin_alloc_pct * (1 - maintenance_margin_pct)
-    if available_margin <= 0:
-        return 0.0
-    
-    # 3. Max lots by margin
-    max_lots_margin = available_margin / margin_per_lot
-    
-    # 4. Loss per lot (stop-loss)
-    loss_per_lot = contract_size * pip_size * stop_loss_pips
-    max_lots_risk = (account_balance * risk_percent) / loss_per_lot if loss_per_lot > 0 else float("inf")
-    
-    # 5. Combine constraints
-    raw_lots = min(max_lots_margin, max_lots_risk)
-    
-    # 6. Apply exposure cap if specified
-    if max_total_exposure_pct is not None:
-        max_value_allowed = account_balance * max_total_exposure_pct
-        max_lots_exposure = max_value_allowed / position_value_per_lot
-        raw_lots = min(raw_lots, max_lots_exposure)
-    
-    # 7. Apply effective leverage cap if specified
-    if max_effective_leverage is not None and max_effective_leverage > 0:
-        max_total_value = account_balance * max_effective_leverage
-        max_lots_efflev = max_total_value / position_value_per_lot
-        raw_lots = min(raw_lots, max_lots_efflev)
-    
-    # 8. Round & enforce min lot
-    steps = np.floor(raw_lots / lot_step)
-    lots = max(0.0, steps * lot_step)
-    if lots < min_lot:
-        lots = 0.0
-    
-    return lots
-
-# --- Execute Backtest ---
-def execute_backtest(signals_df: pd.DataFrame, asset_name: str, starting_balance=10000, leverage=15,
-                     lot_size=1.0, exit_rr=2.0, rr_percent=0.1, stop_loss_pips=50,
-                     margin_alloc_pct=0.5, maintenance_margin_pct=0.1):
-    if signals_df.empty:
-        return pd.DataFrame(), pd.DataFrame(), {}
-
-    balance = starting_balance
-    equity_curve = []
-    trades = []
-
-    for i in range(1, len(signals_df)):
-        signal = signals_df.iloc[i-1]["signal"]
-        price_open = signals_df.iloc[i]["close"]
-        price_prev = signals_df.iloc[i-1]["close"]
-
-        if signal != 0:
-            # Calculate position size with the enhanced function
-            position_lots = calculate_position_size(
-                account_balance=balance,
-                risk_percent=rr_percent,
-                leverage=leverage,
-                stop_loss_pips=stop_loss_pips,
-                asset_name=asset_name,
-                price=price_open,
-                margin_alloc_pct=margin_alloc_pct,
-                maintenance_margin_pct=maintenance_margin_pct
-            ) * lot_size
-            
-            trade_return = ((price_open - price_prev) / price_prev) * leverage * signal * position_lots
-            balance += balance * rr_percent * trade_return
-            rr_actual = trade_return / exit_rr if exit_rr != 0 else 0
-            trades.append({
-                "date": signals_df.iloc[i]["date"],
-                "signal": signal,
-                "price": price_open,
-                "position_lots": position_lots,
-                "trade_return": trade_return,
-                "rr_actual": rr_actual,
-                "balance": balance
-            })
-
-        equity_curve.append({"date": signals_df.iloc[i]["date"], "balance": balance})
-
-    equity_df = pd.DataFrame(equity_curve)
-    trades_df = pd.DataFrame(trades)
-
-    # Full RR metrics
-    wins = trades_df[trades_df["trade_return"] > 0].shape[0]
-    losses = trades_df[trades_df["trade_return"] <= 0].shape[0]
-    win_rate = wins / (wins + losses) if (wins + losses) > 0 else 0
-    average_rr = trades_df["rr_actual"].mean() if not trades_df.empty else 0
-    max_rr = trades_df["rr_actual"].max() if not trades_df.empty else 0
-    min_rr = trades_df["rr_actual"].min() if not trades_df.empty else 0
-
-    metrics = {
-        "final_balance": balance,
-        "total_return": (balance - starting_balance) / starting_balance,
-        "num_trades": len(trades_df),
-        "wins": wins,
-        "losses": losses,
-        "win_rate": win_rate,
-        "average_rr": average_rr,
-        "max_rr": max_rr,
-        "min_rr": min_rr
-    }
-
-    return equity_df, trades_df, metrics
-
-# --- Streamlit Interface ---
-def main():
-    st.title("Health Gauge Trading Strategy Backtester")
-
-    with st.sidebar:
-        st.header("Backtest Parameters")
-
-        # Asset selection
-        selected_asset = st.selectbox("Select Asset", list(assets.keys()), index=0)
-
-        # Time period
-        years_back = st.slider("Years to Backtest", min_value=1, max_value=10, value=3)
-
-        # Signal thresholds
-        buy_thresh = st.number_input("Buy Threshold", min_value=0.0, max_value=1.0, value=0.3, step=0.05)
-        sell_thresh = st.number_input("Sell Threshold", min_value=0.0, max_value=1.0, value=0.7, step=0.05)
-
-        # Position parameters
-        lot_size = st.number_input("Lot Size Multiplier", min_value=0.01, value=1.0, step=0.01)
-        exit_rr = st.number_input("Exit RR", min_value=0.1, value=2.0, step=0.1)
-        rr_percent = st.number_input("RR % of Capital per Trade", min_value=0.01, max_value=1.0, value=0.1, step=0.01)
-        stop_loss_pips = st.number_input("Stop Loss (pips)", min_value=1, value=50, step=1)
-        starting_balance = st.number_input("Starting Balance", min_value=1000, value=10000, step=1000)
-        leverage = st.number_input("Leverage", min_value=1, value=15, step=1)
-        
-        # Additional position sizing parameters
-        margin_alloc_pct = st.slider("Margin Allocation %", min_value=0.1, max_value=1.0, value=0.5, step=0.1)
-        maintenance_margin_pct = st.slider("Maintenance Margin %", min_value=0.05, max_value=0.5, value=0.1, step=0.05)
-
-    # Process data
-    with st.spinner("Loading and processing data..."):
-        # Get data
-        price_df = load_price_data(selected_asset, years_back)
-        cot_df = load_cot_data(selected_asset)
-        
-        if price_df.empty or cot_df.empty:
-            st.error(f"No data available for {selected_asset}. Please try another asset.")
-            return
-        
-        # Calculate RVol
-        price_df = calculate_rvol(price_df)
-        
-        # Merge data
-        signals_df = merge_cot_price(cot_df, price_df)
-        
-        # Generate signals
-        signals_df = generate_signals(signals_df, buy_threshold=buy_thresh, sell_threshold=sell_thresh)
-
-    # Backtest
-    equity_df, trades_df, metrics = execute_backtest(
-        signals_df,
-        asset_name=selected_asset,
-        starting_balance=starting_balance,
-        leverage=leverage,
-        lot_size=lot_size,
-        exit_rr=exit_rr,
-        rr_percent=rr_percent,
-        stop_loss_pips=stop_loss_pips,
-        margin_alloc_pct=margin_alloc_pct,
-        maintenance_margin_pct=maintenance_margin_pct
-    )
-
-    # Display metrics
-    st.subheader("Backtest Metrics")
-    st.write(metrics)
-
-    # Plot equity curve
-    if not equity_df.empty:
-        st.subheader("Equity Curve")
-        fig, ax = plt.subplots()
-        ax.plot(equity_df["date"], equity_df["balance"], label="Equity Curve")
-        ax.set_xlabel("Date")
-        ax.set_ylabel("Balance")
-        ax.legend()
-        st.pyplot(fig)
-
-    # Show Health Gauge over time
-    if not signals_df.empty and "hg" in signals_df.columns:
-        st.subheader("Health Gauge Over Time")
-        fig, ax = plt.subplots()
-        ax.plot(signals_df["date"], signals_df["hg"], label="Health Gauge")
-        ax.axhline(y=buy_thresh, color='g', linestyle='--', label=f"Buy Threshold ({buy_thresh})")
-        ax.axhline(y=sell_thresh, color='r', linestyle='--', label=f"Sell Threshold ({sell_thresh})")
-        ax.set_xlabel("Date")
-        ax.set_ylabel("Health Gauge Value")
-        ax.legend()
-        st.pyplot(fig)
-
-    # Show trades
-    if not trades_df.empty:
-        st.subheader("Trades Executed")
-        st.dataframe(trades_df)
-
-if __name__ == "__main__":
-    main()
