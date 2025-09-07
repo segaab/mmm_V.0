@@ -294,7 +294,7 @@ def main():
         leverage=st.number_input("Leverage",min_value=1.0,value=10.0)
         starting_balance=st.number_input("Account Balance",min_value=1000.0,value=10000.0)
         buy_threshold=st.slider("Buy Threshold",min_value=0.0,max_value=1.0,value=0.6)
-        sell_threshold=st.slider("Sell Threshold",min_value=-1.0,max_value=0.0,value=-0.6)
+        sell_threshold=st.slider("Sell Threshold",min_value=1.0,max_value=10.0,value=0.4)
 
     if st.button("🚀 Run Backtest"):
         with st.spinner("Fetching and processing data..."):
