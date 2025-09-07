@@ -16,6 +16,15 @@ from datetime import timedelta
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# --- Function to display header ---
+def display_prop_firm_header():
+    st.title("📈 Prop Firm Trading Backtester")
+    st.subheader("Welcome to the Prop Firm Trading Challenge!")
+    st.markdown("""
+    This application allows you to backtest your trading strategies according to various prop firm challenges.
+    Please select your parameters from the sidebar to get started!
+    """)
+
 # --- Streamlit Page ---
 st.set_page_config(page_title="PropFirm Trading Backtester", page_icon="📊", layout="wide")
 
@@ -59,7 +68,6 @@ st.markdown("""
 .phase-funded { background: #45b7d1; }  
 </style>  
 """, unsafe_allow_html=True)
-
 
 # --- Risk Profiles for Prop Firms ---
 RISK_PROFILES = {
@@ -143,7 +151,6 @@ assets = {
     "NATURAL GAS - NEW YORK MERCANTILE EXCHANGE": "NG=F",
 }
 
-
 # --- Contract Sizes ---
 CONTRACT_SIZES = {
     "FX": {"default": 100000},
@@ -173,7 +180,7 @@ asset_classes = {
     "NATURAL GAS - NEW YORK MERCANTILE EXCHANGE": ("OIL", "default"),
 }
 
-# --- Data Fetching Functions (keeping your existing ones) ---
+# --- Data Fetching Functions ---
 def fetch_cot_data(market_name: str, max_attempts: int = 3) -> pd.DataFrame:
     where_clause = f'market_and_exchange_names="{market_name}"'
     attempt = 0
@@ -255,7 +262,6 @@ def fetch_price_data_yahoo(ticker: str, start_date: str, end_date: str, max_atte
             attempt += 1
     logger.error("Failed fetching Yahoo data for %s after %d attempts.", ticker, max_attempts)
     return pd.DataFrame()
-
 
 def calculate_rvol(df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
     if df is None or df.empty or "volume" not in df.columns:
@@ -384,7 +390,6 @@ def generate_signals(df, buy_threshold=0.3, sell_threshold=0.7):
     df.loc[df["hg"] < buy_threshold, "signal"] = 1  
 
     return df
-
 
 # --- Enhanced Position Size Calculation with Risk Profile ---
 def calculate_position_size_with_profile(account_balance, risk_profile, asset_name, price, stop_loss_pips=50):
