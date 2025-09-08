@@ -409,7 +409,7 @@ def run_multi_asset_backtest(selected_assets, starting_balance, leverage, lot_mu
 
     return account_equity_df, trades_combined, account_cash
 
-# --- Streamlit UI ---
+
 # --- Streamlit UI ---
 def main():
     st.title("📊 Multi-Asset COT Health Gauge Backtester")
