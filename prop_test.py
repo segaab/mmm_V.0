@@ -281,9 +281,9 @@ def execute_backtest_for_asset(merged_df: pd.DataFrame,
     df = produce_hg_and_signals(merged_df, buy_threshold_input, sell_threshold_input).reset_index(drop=True)
     if "Date" not in df.columns:
         df["Date"] = pd.to_datetime(df.index)
-    if "close" not in df.columns:
+    if "close" not in df.columns or df["close"].isna().all():
         logger.warning("No close price found; backtest will not run for this asset.")
-        return pd.DataFrame(), pd.DataFrame(), starting_balance
+        return pd.DataFrame(), pd.DataFrame(), {"final_cash": starting_balance, "final_equity": starting_balance, "max_drawdown": 0.0}
 
     cash = float(starting_balance)
     equity_curve = []
@@ -301,8 +301,12 @@ def execute_backtest_for_asset(merged_df: pd.DataFrame,
         price = float(row["close"]) if not pd.isna(row["close"]) else np.nan
         signal = row["signal"]
 
+        # Skip if we have a null price
+        if np.isnan(price):
+            continue
+
         unreal = 0.0
-        if position is not None and not np.isnan(price):
+        if position is not None:
             direction = 1 if position["direction"] == "LONG" else -1
             unreal = (price - position["entry_price"]) * position["lots"] * get_contract_size(position["asset_class"], position["symbol"]) * direction
 
@@ -321,27 +325,27 @@ def execute_backtest_for_asset(merged_df: pd.DataFrame,
                 if required_margin > cash:
                     scale = cash / required_margin if required_margin > 0 else 0.0
                     lots = lots * scale
-                lots = float(max(0.0, lots))
-                if lots > 0 and not np.isnan(price):
-                    direction = "LONG" if signal == "BUY" else "SHORT"
-                    entry_price = price
-                    position = {
-                        "direction": direction,
-                        "entry_price": entry_price,
-                        "lots": lots,
-                        "entry_index": i,
-                        "asset_class": asset_class,
-                        "symbol": symbol
-                    }
-                    trades.append({
-                        "entry_date": date,
-                        "direction": direction,
-                        "entry_price": entry_price,
-                        "lots": lots,
-                        "exit_date": None,
-                        "exit_price": None,
-                        "pnl": None
-                    })
+                lots = float(max(0.01, lots))  # Ensure minimum lot size
+                
+                direction = "LONG" if signal == "BUY" else "SHORT"
+                entry_price = price
+                position = {
+                    "direction": direction,
+                    "entry_price": entry_price,
+                    "lots": lots,
+                    "entry_index": i,
+                    "asset_class": asset_class,
+                    "symbol": symbol
+                }
+                trades.append({
+                    "entry_date": date,
+                    "direction": direction,
+                    "entry_price": entry_price,
+                    "lots": lots,
+                    "exit_date": None,
+                    "exit_price": None,
+                    "pnl": None
+                })
         else:
             if (position["direction"] == "LONG" and signal == "SELL") or (position["direction"] == "SHORT" and signal == "BUY"):
                 exit_price = price
@@ -361,6 +365,20 @@ def execute_backtest_for_asset(merged_df: pd.DataFrame,
         if drawdown > max_drawdown:
             max_drawdown = drawdown
 
+    # Close any open positions at the end
+    if position is not None and len(df) > 0:
+        last_row = df.iloc[-1]
+        last_price = float(last_row["close"]) if not pd.isna(last_row["close"]) else np.nan
+        if not np.isnan(last_price):
+            direction = 1 if position["direction"] == "LONG" else -1
+            contract_size = get_contract_size(position["asset_class"], position["symbol"])
+            realized_pnl = (last_price - position["entry_price"]) * position["lots"] * contract_size * direction
+            cash += realized_pnl
+            last_trade = trades[-1]
+            last_trade["exit_date"] = last_row["Date"]
+            last_trade["exit_price"] = last_price
+            last_trade["pnl"] = realized_pnl
+
     equity_df = pd.DataFrame(equity_curve)
     trades_df = pd.DataFrame(trades)
     metrics = {
@@ -369,6 +387,7 @@ def execute_backtest_for_asset(merged_df: pd.DataFrame,
         "max_drawdown": max_drawdown
     }
     return equity_df, trades_df, metrics
+
 
 # ------------------- CHUNK 4 -------------------
 
@@ -424,6 +443,8 @@ def run_multi_asset_backtest(selected_assets, starting_balance, leverage, lot_mu
         account_equity_df = pd.DataFrame([{"date": pd.Timestamp.now(tz=pytz.UTC), "equity": account_cash}])
 
     return account_equity_df, trades_combined, account_cash
+
+    
 
 # --- Streamlit UI & Main ---
 def main():
