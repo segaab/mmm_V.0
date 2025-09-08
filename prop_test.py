@@ -223,8 +223,13 @@ def calculate_health_gauge(df: pd.DataFrame) -> float:
     health_gauge = (0.25 * oi_score + 0.35 * cot_score + 0.40 * pv_score) * 10.0
     return float(np.round(health_gauge, 2))
 
-# --- Produce Health Gauge time-series & signals for one merged dataframe ---
+
+# --- Produce Health Gauge time-series & signals for one merged dataframe (updated) ---
 def produce_hg_and_signals(merged_df: pd.DataFrame, buy_threshold_input: int, sell_threshold_input: int) -> pd.DataFrame:
+    """
+    Calculates the health gauge over time and generates BUY/SELL/HOLD signals
+    using thresholds to improve actionable entries.
+    """
     if merged_df is None or merged_df.empty:
         return merged_df
 
@@ -240,10 +245,12 @@ def produce_hg_and_signals(merged_df: pd.DataFrame, buy_threshold_input: int, se
 
     df["hg"] = hgs
     df["signal"] = "HOLD"
+
+    # Assign BUY/SELL signals based on thresholds
     df.loc[df["hg"] >= buy_th, "signal"] = "BUY"
     df.loc[df["hg"] <= sell_th, "signal"] = "SELL"
-    return df
 
+    return df
 
 
 # ------------------- CHUNK 3 -------------------
