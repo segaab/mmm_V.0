@@ -110,6 +110,9 @@ def get_contract_size(asset_class, symbol=None):
         return CONTRACT_SIZES[asset_class][symbol.upper()]
     return CONTRACT_SIZES[asset_class]["default"]
 
+
+# chunk 2/3
+
 # --- Socrata Client ---
 SODAPY_APP_TOKEN = "PP3ezxaUTiGforvvbBUGzwRx7"
 client = Socrata("publicreporting.cftc.gov", SODAPY_APP_TOKEN, timeout=60)
@@ -123,9 +126,7 @@ def fetch_cot_data(market_name:str,max_attempts:int=3)->pd.DataFrame:
             results=client.get("6dca-aqww",where=where_clause,order="report_date_as_yyyy_mm_dd DESC",limit=1500)
             if not results: return pd.DataFrame()
             df=pd.DataFrame.from_records(results)
-            # make report_date timezone-aware UTC
             df["report_date"]=pd.to_datetime(df.get("report_date_as_yyyy_mm_dd"),errors="coerce").dt.tz_localize(None)
-            # convert to UTC-aware
             df["report_date"]=pd.to_datetime(df["report_date"], utc=True)
             df["commercial_net"]=pd.to_numeric(df.get("commercial_long_all",0),errors="coerce")-pd.to_numeric(df.get("commercial_short_all",0),errors="coerce")
             df["non_commercial_net"]=pd.to_numeric(df.get("non_commercial_long_all",0),errors="coerce")-pd.to_numeric(df.get("non_commercial_short_all",0),errors="coerce")
@@ -146,11 +147,9 @@ def fetch_price_data(ticker:str,years:int=3)->pd.DataFrame:
         if isinstance(df.index,pd.MultiIndex):
             df=df.reset_index(level=0,drop=True)
         df=df.reset_index().rename(columns={"date":"Date"})
-        # ensure timezone-aware UTC
         df["Date"]=pd.to_datetime(df["Date"]).dt.tz_localize(None)
         df["Date"]=pd.to_datetime(df["Date"], utc=True)
         if "volume" not in df.columns: df["volume"]=np.nan
-        # ensure numeric prices exist
         for col in ["close","open","high","low"]:
             if col in df.columns:
                 df[col]=pd.to_numeric(df[col],errors="coerce")
@@ -161,23 +160,18 @@ def fetch_price_data(ticker:str,years:int=3)->pd.DataFrame:
 
 def merge_cot_price(cot_df:pd.DataFrame,price_df:pd.DataFrame)->pd.DataFrame:
     if cot_df.empty or price_df.empty: return pd.DataFrame()
-    # ensure tz-aware and same column names
     cot_df = cot_df.copy()
     price_df = price_df.copy()
     cot_df["report_date"] = pd.to_datetime(cot_df["report_date"], utc=True)
     price_df["Date"] = pd.to_datetime(price_df["Date"], utc=True)
     merged = pd.merge_asof(price_df.sort_values("Date"), cot_df.sort_values("report_date"),
                            left_on="Date", right_on="report_date", direction="backward")
-    # forward-fill COT columns
     for col in ["open_interest_all","commercial_net","non_commercial_net"]:
         if col in merged.columns:
             merged[col] = merged[col].ffill()
         else:
             merged[col] = np.nan
     return merged
-
-
-# chunk 2/3
 
 # --- Relative Volume ---
 def calculate_rvol(df: pd.DataFrame, window: int = 20) -> pd.Series:
@@ -188,19 +182,19 @@ def calculate_rvol(df: pd.DataFrame, window: int = 20) -> pd.Series:
 
 # --- Health Gauge (single snapshot) ---
 def calculate_health_gauge(df: pd.DataFrame) -> float:
-    # Accepts DataFrame slice up to a date and returns a health gauge 0-10
     if df is None or df.empty:
         return float("nan")
+    # Open Interest score
     oi_score = 0.5
     if "open_interest_all" in df.columns:
         oi_series = df["open_interest_all"].dropna()
         if len(oi_series) > 1 and oi_series.max() != oi_series.min():
             oi_score = (oi_series.iloc[-1] - oi_series.min()) / (oi_series.max() - oi_series.min())
-
+    # COT score
     cot_score = 0.5
     if "commercial_net" in df.columns and "non_commercial_net" in df.columns:
-        short_term = df.tail(36)   # approx 3 months of daily rows if data daily
-        long_term = df.tail(144)   # approx 12 months of daily rows
+        short_term = df.tail(36)
+        long_term = df.tail(144)
         st_score = 0.5
         lt_score = 0.5
         if not short_term["commercial_net"].isna().all() and short_term["commercial_net"].max() != short_term["commercial_net"].min():
@@ -210,7 +204,7 @@ def calculate_health_gauge(df: pd.DataFrame) -> float:
             lt_score = (long_term["non_commercial_net"].iloc[-1] - long_term["non_commercial_net"].min()) / \
                        (long_term["non_commercial_net"].max() - long_term["non_commercial_net"].min())
         cot_score = 0.4 * st_score + 0.6 * lt_score
-
+    # Price/Volume score
     pv_score = 0.5
     if "close" in df.columns and "volume" in df.columns:
         df_loc = df.copy()
@@ -219,61 +213,41 @@ def calculate_health_gauge(df: pd.DataFrame) -> float:
         if not recent.empty and "close" in recent.columns:
             recent["price_change"] = recent["close"].pct_change()
             last_ret = recent["price_change"].iloc[-1] if len(recent) > 1 else 0.0
-            if last_ret >= 0.02:
-                bucket = 5
-            elif last_ret >= 0.01:
-                bucket = 4
-            elif last_ret >= -0.01:
-                bucket = 3
-            elif last_ret >= -0.02:
-                bucket = 2
-            else:
-                bucket = 1
+            if last_ret >= 0.02: bucket = 5
+            elif last_ret >= 0.01: bucket = 4
+            elif last_ret >= -0.01: bucket = 3
+            elif last_ret >= -0.02: bucket = 2
+            else: bucket = 1
             pv_score = (bucket - 1) / 4.0
-
     health_gauge = (0.25 * oi_score + 0.35 * cot_score + 0.40 * pv_score) * 10.0
     return float(np.round(health_gauge, 2))
 
-
-# --- Produce Health Gauge time-series & signals for one merged dataframe ---
+# --- Produce Health Gauge time-series & signals ---
 def produce_hg_and_signals(merged_df: pd.DataFrame, buy_threshold_input: int, sell_threshold_input: int) -> pd.DataFrame:
-    """
-    merged_df must be price rows with COT fields forward-filled.
-    buy_threshold_input & sell_threshold_input are integers 1-10 from the UI.
-    We will compute hg (0-10) per row by feeding the cumulative slice up to that row to calculate_health_gauge.
-    """
     if merged_df is None or merged_df.empty:
         return merged_df
-
     df = merged_df.copy().reset_index(drop=True)
     hgs = []
-    # thresholds stay in 0-10 units for direct comparison to hg
     buy_th = float(buy_threshold_input)
     sell_th = float(sell_threshold_input)
-
     for i in range(len(df)):
         slice_df = df.iloc[:i+1]
         hg = calculate_health_gauge(slice_df)
         hgs.append(hg)
-
     df["hg"] = hgs
-    # generate signals: BUY when hg >= buy_th, SELL when hg <= sell_th, else HOLD
     df["signal"] = "HOLD"
     df.loc[df["hg"] >= buy_th, "signal"] = "BUY"
     df.loc[df["hg"] <= sell_th, "signal"] = "SELL"
     return df
 
-# --- base lot size (without multiplier) using risk-per-trade from profile ---
+
+
+# chunk 3/3
+
+# --- Base lot size calculation ---
 def calculate_base_lot_size(account_balance: float, price: float, asset_class: str, symbol: str, risk_pct: float) -> float:
-    """
-    Calculate number of contracts/lots such that the risk (%) of the account equals risk_pct
-    This is a conservative approximate calculation using contract size and an assumed pip distance
-    (we assume stop distance as a nominal value or will be controlled externally).
-    """
     contract_size = get_contract_size(asset_class, symbol)
-    # default pip for FX vs others
     pip_val_per_unit = 0.0001 if asset_class == "FX" else 0.01
-    # assume a nominal stop distance in pips (user can change via UI/stop param); for base lot calc we use 50 pips
     assumed_stop_pips = 50
     loss_per_lot = contract_size * pip_val_per_unit * assumed_stop_pips
     if loss_per_lot <= 0 or np.isnan(loss_per_lot):
@@ -282,7 +256,7 @@ def calculate_base_lot_size(account_balance: float, price: float, asset_class: s
     base_lots = risk_amount / loss_per_lot
     return float(max(0.0, base_lots))
 
-# --- Backtest executor for a single asset time-series ---
+# --- Backtest executor for a single asset ---
 def execute_backtest_for_asset(merged_df: pd.DataFrame,
                                starting_balance: float,
                                leverage: float,
@@ -290,19 +264,9 @@ def execute_backtest_for_asset(merged_df: pd.DataFrame,
                                buy_threshold_input: int,
                                sell_threshold_input: int,
                                risk_profile: dict):
-    """
-    Returns equity_df (per-row equity), trades_df (list of executed trades), and final cash balance.
-    Simple logic:
-      - enter when signal changes from HOLD to BUY (or SELL) and no open position
-      - exit when opposite direction signal occurs OR HOLD (simple exit rule)
-      - entries/exits at next row's close (if next row exists); else use current close
-      - margin enforcement via leverage and profile limits
-    """
     if merged_df is None or merged_df.empty:
         return pd.DataFrame(), pd.DataFrame(), starting_balance
-
     df = produce_hg_and_signals(merged_df, buy_threshold_input, sell_threshold_input).reset_index(drop=True)
-    # Ensure date and price columns exist
     if "Date" not in df.columns:
         df["Date"] = pd.to_datetime(df.index)
     if "close" not in df.columns:
@@ -312,10 +276,9 @@ def execute_backtest_for_asset(merged_df: pd.DataFrame,
     cash = float(starting_balance)
     equity_curve = []
     trades = []
-    position = None  # dict with keys: direction ('LONG' or 'SHORT'), entry_price, lots, entry_index
+    position = None
     peak_equity = cash
     max_drawdown = 0.0
-
     risk_per_trade = risk_profile.get("max_risk_per_trade", 0.01)
     profile_max_lot = risk_profile.get("max_lot_size", None)
 
@@ -325,7 +288,6 @@ def execute_backtest_for_asset(merged_df: pd.DataFrame,
         price = float(row["close"]) if not pd.isna(row["close"]) else np.nan
         signal = row["signal"]
 
-        # compute unrealized PnL if position exists
         unreal = 0.0
         if position is not None and not np.isnan(price):
             direction = 1 if position["direction"] == "LONG" else -1
@@ -334,35 +296,18 @@ def execute_backtest_for_asset(merged_df: pd.DataFrame,
         equity = cash + unreal
         equity_curve.append({"date": date, "equity": equity, "cash": cash, "unrealized": unreal})
 
-        # Check open/close decisions using next available row for entry/exit price
         if position is None:
-            # attempt entry: BUY -> LONG, SELL -> SHORT
-            if signal == "BUY" or signal == "SELL":
-                # compute base lots from risk_per_trade
-                asset_class, symbol = position_asset_class = (position_asset_class if False else ( "FX", "default"))  # placeholder: will be set by caller below
-                # but we need asset_class/symbol from merged_df columns - caller should provide via closure; to keep this function generic
-                # we'll expect merged_df has columns 'asset_class' and 'symbol' if set earlier; if not, use mapping by ticker symbol
-                if "asset_class" in df.columns and "symbol" in df.columns:
-                    asset_class = df.loc[i, "asset_class"]
-                    symbol = df.loc[i, "symbol"]
-                else:
-                    # fallback to reasonable defaults
-                    asset_class = "FX"
-                    symbol = "default"
-
+            if signal in ["BUY", "SELL"]:
+                asset_class, symbol = df.loc[i, "asset_class"] if "asset_class" in df.columns else ("FX", "default"), df.loc[i, "symbol"] if "symbol" in df.columns else "default"
                 base_lots = calculate_base_lot_size(cash, price, asset_class, symbol, risk_per_trade)
                 lots = base_lots * lot_multiplier
-                # enforce profile max lot
                 if profile_max_lot is not None:
                     lots = min(lots, profile_max_lot)
-                # enforce leverage constraint: position_value = price * contract_size * lots
                 position_value = price * get_contract_size(asset_class, symbol) * lots
                 required_margin = position_value / leverage if leverage > 0 else position_value
-                # if required_margin > cash, scale lots down
                 if required_margin > cash:
                     scale = cash / required_margin if required_margin > 0 else 0.0
                     lots = lots * scale
-
                 lots = float(max(0.0, lots))
                 if lots > 0 and not np.isnan(price):
                     direction = "LONG" if signal == "BUY" else "SHORT"
@@ -385,22 +330,18 @@ def execute_backtest_for_asset(merged_df: pd.DataFrame,
                         "pnl": None
                     })
         else:
-            # have an open position: check for exit condition (opposite signal)
             if (position["direction"] == "LONG" and signal == "SELL") or (position["direction"] == "SHORT" and signal == "BUY"):
-                # close at current price
                 exit_price = price
                 direction = 1 if position["direction"] == "LONG" else -1
                 contract_size = get_contract_size(position["asset_class"], position["symbol"])
                 realized_pnl = (exit_price - position["entry_price"]) * position["lots"] * contract_size * direction
                 cash += realized_pnl
-                # finalize trade entry in trades list
                 last_trade = trades[-1]
                 last_trade["exit_date"] = date
                 last_trade["exit_price"] = exit_price
                 last_trade["pnl"] = realized_pnl
                 position = None
 
-        # track drawdown & peak equity
         if equity > peak_equity:
             peak_equity = equity
         drawdown = (peak_equity - equity) / peak_equity if peak_equity > 0 else 0
@@ -416,21 +357,9 @@ def execute_backtest_for_asset(merged_df: pd.DataFrame,
     }
     return equity_df, trades_df, metrics
 
-
-
-
-# chunk 3/3
-
-# --- Multi-asset driver that orchestrates per-asset backtest and aggregates equity into a single account ---
+# --- Multi-asset backtest orchestration ---
 def run_multi_asset_backtest(selected_assets, starting_balance, leverage, lot_multiplier,
                              buy_input, sell_input, risk_profile_name):
-    """
-    For each asset perform its own backtest and sequentially apply trades to a single account.
-    Simpler model: process each asset independently and aggregate equity series by summing per-asset PnL
-    onto the same cash pool. For a precise time-aligned multi-asset engine you'd need to align all dates and iterate time
-    across the global union of dates — here we run asset-by-asset while preserving a single cash pool that updates as trades are realized.
-    """
-    # pick risk profile
     risk_profile = RISK_PROFILES.get(risk_profile_name, {"max_risk_per_trade": 0.01})
     account_cash = float(starting_balance)
     all_equity_series = []
@@ -444,7 +373,6 @@ def run_multi_asset_backtest(selected_assets, starting_balance, leverage, lot_mu
         if merged.empty:
             logger.warning(f"No merged data for {asset}, skipping.")
             continue
-        # tag asset class & symbol in merged to help executor
         ac, sym = asset_classes.get(asset, ("FX", "default"))
         merged["asset_class"] = ac
         merged["symbol"] = sym
@@ -459,11 +387,9 @@ def run_multi_asset_backtest(selected_assets, starting_balance, leverage, lot_mu
             risk_profile=risk_profile
         )
 
-        # after each asset backtest, update account_cash to the final cash returned (sequential processing)
         if metrics and "final_cash" in metrics:
             account_cash = metrics["final_cash"]
 
-        # prefix trade rows with asset name
         if not trades_df.empty:
             trades_df["asset"] = asset
             all_trades.append(trades_df)
@@ -471,16 +397,12 @@ def run_multi_asset_backtest(selected_assets, starting_balance, leverage, lot_mu
             equity_df["asset"] = asset
             all_equity_series.append(equity_df)
 
-    # combine trades and equity for display
     trades_combined = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
     equity_combined = pd.concat(all_equity_series, ignore_index=True) if all_equity_series else pd.DataFrame()
 
-    # build a simple account-level equity curve by resampling equity across assets by date and summing:
     if not equity_combined.empty:
         equity_by_date = equity_combined.groupby("date")["equity"].sum().sort_index()
-        # add starting cash for baseline (if needed)
         account_equity_df = equity_by_date.reset_index().rename(columns={"equity": "equity"})
-        # if the first date equity doesn't equal starting_balance, shift/add starting_balance baseline
         if account_equity_df["equity"].iloc[0] == 0:
             account_equity_df["equity"] = account_equity_df["equity"] + starting_balance
     else:
@@ -488,10 +410,9 @@ def run_multi_asset_backtest(selected_assets, starting_balance, leverage, lot_mu
 
     return account_equity_df, trades_combined, account_cash
 
-# --- Streamlit UI & Main ---
+# --- Streamlit UI ---
 def main():
     display_prop_firm_header()
-
     with st.sidebar:
         st.header("⚙️ Backtest Settings")
         risk_profile_name = st.selectbox("Risk Profile", list(RISK_PROFILES.keys()), index=0)
@@ -499,9 +420,8 @@ def main():
         years_back = st.slider("Years of Historical Data", min_value=1, max_value=10, value=3)
         leverage = st.number_input("Leverage", min_value=1.0, value=10.0)
         starting_balance = st.number_input("Account Balance", min_value=1000.0, value=10000.0)
-        # UI thresholds 1-10 (clear semantics: buy requires HG >= buy_input; sell requires HG <= sell_input)
-        buy_input = st.slider("Buy Threshold (1–10, higher => stronger buy)", min_value=1, max_value=10, value=7, step=1)
-        sell_input = st.slider("Sell Threshold (1–10, lower => stronger sell)", min_value=1, max_value=10, value=3, step=1)
+        buy_input = st.slider("Buy Threshold (1–10)", min_value=1, max_value=10, value=7)
+        sell_input = st.slider("Sell Threshold (1–10)", min_value=1, max_value=10, value=3)
         lot_multiplier = st.number_input("Lot Size Multiplier", min_value=0.01, value=1.0, step=0.01)
 
     if st.button("🚀 Run Backtest"):
@@ -527,30 +447,8 @@ def main():
 
         st.subheader("📊 Trades Executed")
         if not trades_df.empty:
-            # format trades for display
             trades_display = trades_df.copy()
             trades_display["entry_date"] = pd.to_datetime(trades_display["entry_date"])
             if "exit_date" in trades_display:
                 trades_display["exit_date"] = pd.to_datetime(trades_display["exit_date"])
-            st.dataframe(trades_display.sort_values("entry_date", ascending=False).reset_index(drop=True))
-        else:
-            st.info("No trades executed - signal conditions did not produce entries.")
-
-        st.subheader("💰 Final Account Summary")
-        st.metric("Final Cash", f"${final_cash:,.2f}")
-        # simple baseline stats from trades_df
-        if not trades_df.empty:
-            total_pnl = trades_df["pnl"].sum()
-            wins = trades_df[trades_df["pnl"] > 0].shape[0]
-            losses = trades_df[trades_df["pnl"] <= 0].shape[0]
-            win_rate = (wins / (wins + losses)) * 100 if (wins + losses) > 0 else 0.0
-            st.write({
-                "total_trades": int(wins + losses),
-                "wins": int(wins),
-                "losses": int(losses),
-                "win_rate_pct": round(win_rate, 2),
-                "total_pnl": float(total_pnl)
-            })
-
-if __name__ == "__main__":
-    main()
+            st.dataframe(trades_display.sort_values("entry_date", ascending=False).reset_index(drop
