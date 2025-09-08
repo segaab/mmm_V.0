@@ -410,3 +410,51 @@ def run_multi_asset_backtest(selected_assets, starting_balance, leverage, lot_mu
     return account_equity_df, trades_combined, account_cash
 
 # --- Streamlit UI ---
+# --- Streamlit UI ---
+def main():
+    st.title("📊 Multi-Asset COT Health Gauge Backtester")
+    with st.sidebar:
+        st.header("⚙️ Backtest Settings")
+        risk_profile_name = st.selectbox("Risk Profile", list(RISK_PROFILES.keys()), index=0)
+        selected_assets = st.multiselect("Select Assets", list(assets.keys()), default=list(assets.keys())[:2])
+        years_back = st.slider("Years of Historical Data", min_value=1, max_value=10, value=3)
+        leverage = st.number_input("Leverage", min_value=1.0, value=10.0)
+        starting_balance = st.number_input("Account Balance", min_value=1000.0, value=10000.0)
+        buy_input = st.slider("Buy Threshold (1–10)", min_value=1, max_value=10, value=7)
+        sell_input = st.slider("Sell Threshold (1–10)", min_value=1, max_value=10, value=3)
+        lot_multiplier = st.number_input("Lot Size Multiplier", min_value=0.01, value=1.0, step=0.01)
+
+    if st.button("🚀 Run Backtest"):
+        with st.spinner("Running backtest across selected assets..."):
+            account_equity_df, trades_df, final_cash = run_multi_asset_backtest(
+                selected_assets=selected_assets,
+                starting_balance=starting_balance,
+                leverage=leverage,
+                lot_multiplier=lot_multiplier,
+                buy_input=buy_input,
+                sell_input=sell_input,
+                risk_profile_name=risk_profile_name
+            )
+
+        st.subheader("📈 Account Equity Curve")
+        if not account_equity_df.empty:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=account_equity_df["date"], y=account_equity_df["equity"], mode="lines", name="Equity"))
+            fig.update_layout(title="Account Equity Curve", xaxis_title="Date", yaxis_title="Equity")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No equity data available.")
+
+        st.subheader("📊 Trades Executed")
+        if not trades_df.empty:
+            trades_display = trades_df.copy()
+            trades_display["entry_date"] = pd.to_datetime(trades_display["entry_date"])
+            if "exit_date" in trades_display:
+                trades_display["exit_date"] = pd.to_datetime(trades_display["exit_date"])
+            st.dataframe(trades_display.sort_values("entry_date", ascending=False).reset_index(drop=True))
+        else:
+            st.info("No trades executed.")
+
+# --- Run the Streamlit app ---
+if __name__ == "__main__":
+    main()
