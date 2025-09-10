@@ -4,7 +4,9 @@ from yahooquery import Ticker
 from datetime import timedelta, datetime
 import plotly.graph_objs as go
 
-# ------------------- ASSETS -------------------
+# -------------------------------
+# Ticker map (assets only)
+# -------------------------------
 TICKER_MAP = {
     "GOLD - COMMODITY EXCHANGE INC.": "GC=F",
     "EURO FX - CHICAGO MERCANTILE EXCHANGE": "6E=F",
@@ -17,6 +19,9 @@ TICKER_MAP = {
     "JAPANESE YEN - CHICAGO MERCANTILE EXCHANGE": "6J=F",
     "CANADIAN DOLLAR - CHICAGO MERCANTILE EXCHANGE": "6C=F",
     "BRITISH POUND - CHICAGO MERCANTILE EXCHANGE": "6B=F",
+    "U.S. DOLLAR INDEX - ICE FUTURES U.S.": "DX-Y.NYB",
+    "NEW ZEALAND DOLLAR - CHICAGO MERCANTILE EXCHANGE": "6N=F",
+    "SWISS FRANC - CHICAGO MERCANTILE EXCHANGE": "6S=F",
     "DOW JONES U.S. REAL ESTATE IDX - CHICAGO BOARD OF TRADE": "^DJI",
     "E-MINI S&P 500 STOCK INDEX - CHICAGO MERCANTILE EXCHANGE": "ES=F",
     "NASDAQ-100 STOCK INDEX (MINI) - CHICAGO MERCANTILE EXCHANGE": "NQ=F",
@@ -24,101 +29,37 @@ TICKER_MAP = {
     "COPPER - COMMODITY EXCHANGE INC.":"HG=F"
 }
 
-asset_symbols = list(TICKER_MAP.values())
 TICKER_TO_NAME = {v: k for k, v in TICKER_MAP.items()}
+symbols = list(TICKER_MAP.values())
 
-DAYS = 730  # Default 2 years rolling window
-ROLLING_WINDOW = 120
-
-# ------------------- STREAMLIT PAGE -------------------
-st.title("RVol Gap-Up Backtester")
-
-# Backtesting date range
+# -------------------------------
+# Sidebar - Backtesting Settings
+# -------------------------------
 st.sidebar.header("Backtesting Settings")
-start_date = st.sidebar.date_input("Start Date", value=pd.to_datetime("2023-01-01"))
-end_date = st.sidebar.date_input("End Date", value=pd.to_datetime(datetime.today().date()))
-if start_date > end_date:
-    st.sidebar.error("Start Date must be before End Date.")
 
-# Select entry session
-market_open_session = st.sidebar.selectbox(
-    "Select Entry Session:",
-    ["London (10:00-11:00)", "NY (16:00-17:00)", "Asian (3:00-4:00)"]
+start_date = st.sidebar.date_input(
+    "Start Date", pd.to_datetime("2023-01-01").date(), key="start_date"
 )
-if market_open_session.startswith("London"):
-    open_hours = [10, 11]
-elif market_open_session.startswith("NY"):
-    open_hours = [16, 17]
-else:
-    open_hours = [3, 4]
+end_date = st.sidebar.date_input(
+    "End Date", pd.to_datetime("2025-01-01").date(), key="end_date"
+)
 
-# Days of history to calculate rolling average
-rolling_window = st.sidebar.number_input("RVol Rolling Window (hours)", min_value=10, max_value=500, value=ROLLING_WINDOW)
-
-
-# ------------------- DATA FETCHING -------------------
-@st.cache_data(show_spinner=True)
-def fetch_rvol_data(symbol, start_date, end_date):
-    t = Ticker(symbol, timeout=60)
-    hist = t.history(period=f"{DAYS}d", interval="1h")
-    if isinstance(hist, pd.DataFrame) and not hist.empty:
-        if isinstance(hist.index, pd.MultiIndex):
-            hist = hist.reset_index()
-        hist = hist.rename(columns={"symbol": "ticker"})
-        hist = hist.dropna(subset=["volume", "date"])
-        hist = hist[hist["volume"] > 0]
-        hist["datetime"] = pd.to_datetime(hist["date"], errors="coerce", utc=True)
-        hist = hist.dropna(subset=["datetime"])
-        hist = hist.sort_values("datetime")
-        # Filter by backtesting date range
-        hist = hist[(hist["datetime"].dt.date >= start_date) & (hist["datetime"].dt.date <= end_date)]
-        # Convert to GMT+3
-        hist["datetime_gmt3"] = hist["datetime"] + timedelta(hours=3)
-        hist["datetime_gmt3"] = hist["datetime_gmt3"].dt.strftime("%Y-%m-%dT%H:%M:%S+03:00")
-        # Calculate rolling average and rvol
-        hist["avg_volume"] = hist["volume"].rolling(rolling_window).mean()
-        hist["rvol"] = hist["volume"] / hist["avg_volume"]
-        return hist
-    else:
-        return pd.DataFrame()
-
-# ------------------- GAP-UP DETECTION -------------------
-def detect_gap_up(df, open_hours):
-    if df.empty:
-        return None
-    df = df.copy()
-    df["datetime_gmt3_dt"] = pd.to_datetime(df["datetime_gmt3"], errors="coerce")
-    df = df.dropna(subset=["datetime_gmt3_dt"])
-    df = df.sort_values("datetime_gmt3_dt", ascending=False)
-    df["date_gmt3"] = df["datetime_gmt3_dt"].dt.date
-    df["hour_gmt3"] = df["datetime_gmt3_dt"].dt.hour
-    if df.empty or len(df["date_gmt3"].unique()) < 2:
-        return None
-    # Latest and previous day
-    latest_day = df.iloc[0]["date_gmt3"]
-    prev_day = latest_day - pd.Timedelta(days=1)
-    curr_open = df[(df["date_gmt3"] == latest_day) & (df["hour_gmt3"].isin(open_hours))]["rvol"]
-    prev_open = df[(df["date_gmt3"] == prev_day) & (df["hour_gmt3"].isin(open_hours))]["rvol"]
-    if curr_open.empty or prev_open.empty:
-        return None
-    curr_mean = curr_open.mean()
-    prev_mean = prev_open.mean()
-    if prev_mean == 0 or pd.isna(prev_mean):
-        return None
-    gap_ratio = curr_mean / prev_mean
-    return {"latest_day": latest_day, "curr_rvol": curr_mean, "prev_rvol": prev_mean, "gap_ratio": gap_ratio}
-
-# ------------------- DISTRIBUTION & STATS -------------------
-import numpy as np
-
-st.sidebar.header("Backtesting & Entry Session")
-start_date = st.sidebar.date_input("Start Date", pd.to_datetime("2023-01-01").date())
-end_date = st.sidebar.date_input("End Date", pd.to_datetime("2025-01-01").date())
 entry_session = st.sidebar.selectbox(
     "Select Entry Session:",
-    ["London (10:00-11:00)", "NY (16:00-17:00)", "Asian (3:00-4:00)"]
+    ["London (10:00-11:00)", "NY (16:00-17:00)", "Asian (3:00-4:00)"],
+    key="entry_session"
 )
 
+rolling_window = st.sidebar.number_input(
+    "RVol Rolling Window (hours)", min_value=1, max_value=500, value=120, step=1,
+    key="rolling_window"
+)
+
+st.title("RVol Gap-Up Backtester")
+
+# -------------------------------
+# Determine market open hours based on session
+# -------------------------------
 if entry_session.startswith("London"):
     open_hours = [10, 11]
 elif entry_session.startswith("NY"):
@@ -128,39 +69,124 @@ elif entry_session.startswith("Asian"):
 else:
     open_hours = [16, 17]
 
-gap_ratios_all = []
+# -------------------------------
+# Functions
+# -------------------------------
+def detect_gap_up(df, open_hours, threshold=1.5):
+    if df.empty:
+        return False, None, None
+    df = df.copy()
+    df["datetime_gmt3_dt"] = pd.to_datetime(df["datetime_gmt3"], errors="coerce")
+    df = df.dropna(subset=["datetime_gmt3_dt"])
+    df = df.sort_values("datetime_gmt3_dt", ascending=False)
+    df["date_gmt3"] = df["datetime_gmt3_dt"].dt.date
+    df["hour_gmt3"] = df["datetime_gmt3_dt"].dt.hour
+    if df.empty:
+        return False, None, None
+    latest_day = df.iloc[0]["date_gmt3"]
+    prev_day = latest_day - pd.Timedelta(days=1)
+    curr_open = df[(df["date_gmt3"] == latest_day) & (df["hour_gmt3"].isin(open_hours))]["rvol"]
+    prev_open = df[(df["date_gmt3"] == prev_day) & (df["hour_gmt3"].isin(open_hours))]["rvol"]
+    if curr_open.empty or prev_open.empty:
+        return False, None, None
+    curr_mean = curr_open.mean()
+    prev_mean = prev_open.mean()
+    if prev_mean == 0 or pd.isna(prev_mean):
+        return False, curr_mean, prev_mean
+    gap_ratio = curr_mean / prev_mean
+    return gap_ratio >= threshold, curr_mean, prev_mean
 
-st.title("RVol Gap-Up Backtesting Distribution")
+@st.cache_data(show_spinner=True)
+def fetch_rvol_data(symbol):
+    t = Ticker(symbol, timeout=60)
+    hist = t.history(period="730d", interval="1h")
+    if isinstance(hist, pd.DataFrame) and not hist.empty:
+        if isinstance(hist.index, pd.MultiIndex):
+            hist = hist.reset_index()
+        hist = hist.rename(columns={"symbol": "ticker"})
+        hist = hist.dropna(subset=["volume", "date"])
+        hist = hist[hist["volume"] > 0]
+        hist["datetime"] = pd.to_datetime(hist["date"], errors="coerce", utc=True)
+        hist = hist.dropna(subset=["datetime"])
+        hist = hist.sort_values("datetime")
+        # Convert to GMT+3
+        hist["datetime_gmt3"] = hist["datetime"] + timedelta(hours=3)
+        hist["datetime_gmt3"] = hist["datetime_gmt3"].dt.strftime("%Y-%m-%dT%H:%M:%S+03:00")
+        # Calculate rolling average volume and rvol
+        hist["avg_volume"] = hist["volume"].rolling(rolling_window).mean()
+        hist["rvol"] = hist["volume"] / hist["avg_volume"]
+        # Filter by backtesting date range
+        hist = hist[(hist["datetime_gmt3_dt"] := pd.to_datetime(hist["datetime_gmt3"], errors="coerce")) >= pd.to_datetime(start_date)]
+        hist = hist[hist["datetime_gmt3_dt"] <= pd.to_datetime(end_date)]
+        return hist
+    else:
+        return pd.DataFrame()
+
+# -------------------------------
+# Backtesting and RVol Gap-Up Analysis
+# -------------------------------
+st.header("RVol Gap-Up Backtesting Results")
+
+distribution_results = []
 
 for symbol in asset_symbols:
-    df = fetch_rvol_data(symbol, start_date, end_date)
-    gap_info = detect_gap_up(df, open_hours)
-    if not gap_info:
+    asset_name = TICKER_TO_NAME.get(symbol, symbol)
+    df = fetch_rvol_data(symbol)
+    if df.empty:
+        st.warning(f"No data found for {asset_name} ({symbol}) in the selected date range.")
         continue
-    gap_ratios_all.append(gap_info["gap_ratio"])
 
-if not gap_ratios_all:
-    st.warning("No valid gap-up data found for selected assets and date range.")
-else:
-    gap_ratios_all = np.array(gap_ratios_all)
-    st.subheader("Gap-Up Distribution")
-    import plotly.express as px
-    fig = px.histogram(gap_ratios_all, nbins=20, labels={"value": "Gap-Up Ratio"}, title="RVol Gap-Up Ratios Distribution")
+    # Gap-up detection per day
+    df["datetime_gmt3_dt"] = pd.to_datetime(df["datetime_gmt3"], errors="coerce")
+    df = df.dropna(subset=["datetime_gmt3_dt"])
+    df["date_gmt3"] = df["datetime_gmt3_dt"].dt.date
+    df["hour_gmt3"] = df["datetime_gmt3_dt"].dt.hour
+
+    daily_results = []
+    unique_dates = sorted(df["date_gmt3"].unique())
+    for day in unique_dates[1:]:  # Skip the first day, no previous day to compare
+        prev_day = day - pd.Timedelta(days=1)
+        curr_open = df[(df["date_gmt3"] == day) & (df["hour_gmt3"].isin(open_hours))]["rvol"]
+        prev_open = df[(df["date_gmt3"] == prev_day) & (df["hour_gmt3"].isin(open_hours))]["rvol"]
+        if curr_open.empty or prev_open.empty:
+            continue
+        curr_mean = curr_open.mean()
+        prev_mean = prev_open.mean()
+        gap_ratio = curr_mean / prev_mean if prev_mean != 0 else 0
+        daily_results.append(gap_ratio)
+
+    if not daily_results:
+        st.info(f"No valid gap-up days found for {asset_name} ({symbol}).")
+        continue
+
+    # Calculate distribution statistics
+    daily_series = pd.Series(daily_results)
+    percentile_values = [50, 70, 80, 90, 95]
+    percentiles = daily_series.quantile([p/100 for p in percentile_values])
+
+    # Display summary stats
+    st.subheader(f"{asset_name} ({symbol}) Gap-Up Distribution")
+    st.write(daily_series.describe())
+    st.write("Selected Percentiles:")
+    for p, val in zip(percentile_values, percentiles):
+        st.write(f"{p}th percentile: {val:.2f}")
+
+    # Plot histogram
+    import plotly.graph_objs as go
+    fig = go.Figure()
+    fig.add_trace(go.Histogram(x=daily_series, nbinsx=30, marker_color="blue"))
+    fig.update_layout(
+        title=f"Gap-Up RVol Distribution — {asset_name} ({symbol})",
+        xaxis_title="Gap-Up Ratio",
+        yaxis_title="Frequency",
+        height=400
+    )
     st.plotly_chart(fig, use_container_width=True)
 
-    # Compute percentiles and stats
-    percentile_50 = np.percentile(gap_ratios_all, 50)
-    percentile_70 = np.percentile(gap_ratios_all, 70)
-    percentile_90 = np.percentile(gap_ratios_all, 90)
-    st.markdown(f"**50th percentile:** {percentile_50:.2f}")
-    st.markdown(f"**70th percentile:** {percentile_70:.2f}")
-    st.markdown(f"**90th percentile:** {percentile_90:.2f}")
+    distribution_results.append({
+        "asset": asset_name,
+        "symbol": symbol,
+        "daily_gap_ratios": daily_series
+    })
 
-    # Approximate win rate / RR logic
-    st.subheader("Win Rate & Risk/Reward by Gap-Up Percentile")
-    for perc, label in zip([50, 70, 90], ["Median", "High", "Extreme"]):
-        wins = (gap_ratios_all >= np.percentile(gap_ratios_all, perc)).sum()
-        total = len(gap_ratios_all)
-        win_rate = wins / total * 100
-        rr = np.mean(gap_ratios_all[gap_ratios_all >= np.percentile(gap_ratios_all, perc)]) / np.mean(gap_ratios_all)
-        st.markdown(f"**{label} Gap-Ups ({perc}th percentile):** Win Rate = {win_rate:.1f}%, Avg RR = {rr:.2f}")
+st.success("Backtesting complete. Distribution stats and gap-up ratios displayed for all assets.")
