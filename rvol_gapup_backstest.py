@@ -67,36 +67,50 @@ else:
 
 # ------------------- Functions -------------------
 @st.cache_data(show_spinner=True)
-def fetch_rvol_data(symbol, start_date, end_date):
+def fetch_rvol_data(symbol, start_date=None, end_date=None):
     """
-    Fetch hourly data for a symbol from YahooQuery and calculate RVol.
+    Fetch 1-hour historical data for a symbol using YahooQuery, calculate RVol.
+    Optionally filter by start_date and end_date.
     """
     t = Ticker(symbol, timeout=60)
-    hist = t.history(period="max", interval="1h")
-    if hist.empty:
+    
+    # Fetch 1-hour interval data for max available period (up to 2 years)
+    hist = t.history(period="730d", interval="1h")
+    
+    if isinstance(hist, pd.DataFrame) and not hist.empty:
+        # Handle MultiIndex returned by YahooQuery
+        if isinstance(hist.index, pd.MultiIndex):
+            hist = hist.reset_index()
+        
+        hist = hist.rename(columns={"symbol": "ticker"})
+        hist = hist.dropna(subset=["volume", "date"])
+        hist = hist[hist["volume"] > 0]
+
+        # Convert to datetime
+        hist["datetime"] = pd.to_datetime(hist["date"], errors="coerce", utc=True)
+        hist = hist.dropna(subset=["datetime"])
+        hist = hist.sort_values("datetime")
+
+        # Convert to GMT+3
+        hist["datetime_gmt3"] = hist["datetime"] + timedelta(hours=3)
+        hist["datetime_gmt3_dt"] = hist["datetime_gmt3"]
+
+        # Filter by backtesting date range if provided
+        if start_date:
+            hist = hist[hist["datetime_gmt3_dt"] >= pd.to_datetime(start_date)]
+        if end_date:
+            hist = hist[hist["datetime_gmt3_dt"] <= pd.to_datetime(end_date)]
+
+        # Calculate rolling average volume and RVol
+        hist["avg_volume"] = hist["volume"].rolling(ROLLING_WINDOW).mean()
+        hist["rvol"] = hist["volume"] / hist["avg_volume"]
+
+        # Drop rows with NaN rvol (first ROLLING_WINDOW rows)
+        hist = hist.dropna(subset=["rvol"])
+
+        return hist
+    else:
         return pd.DataFrame()
-    
-    if isinstance(hist.index, pd.MultiIndex):
-        hist = hist.reset_index()
-    hist = hist.rename(columns={"symbol": "ticker", "date": "datetime"})
-    hist = hist.dropna(subset=["volume", "datetime"])
-    hist = hist[hist["volume"] > 0]
-    hist["datetime"] = pd.to_datetime(hist["datetime"], errors="coerce", utc=True)
-    hist = hist.dropna(subset=["datetime"])
-    hist = hist.sort_values("datetime")
-    
-    # Filter by backtesting date range
-    hist = hist[(hist["datetime"] >= pd.to_datetime(start_date)) & (hist["datetime"] <= pd.to_datetime(end_date))]
-    
-    # Convert to GMT+3
-    hist["datetime_gmt3"] = hist["datetime"] + timedelta(hours=3)
-    hist["datetime_gmt3_dt"] = hist["datetime_gmt3"]
-    
-    # RVol calculation
-    hist["avg_volume"] = hist["volume"].rolling(rvol_window).mean()
-    hist["rvol"] = hist["volume"] / hist["avg_volume"]
-    
-    return hist
 
 def detect_gap_up(df, hours):
     """
