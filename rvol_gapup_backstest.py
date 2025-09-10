@@ -177,58 +177,48 @@ def plot_results(df, trades, ticker):
     fig.update_layout(title=f"Backtest Results - {ticker}", xaxis_title="Date", yaxis_title="Price")
     return fig
 
+
+
 # ------------------- CHUNK 3 -------------------
+# Main Streamlit App Logic
 
-def run_backtest_for_ticker(ticker, session_hours, threshold):
-    """Run full pipeline for a single ticker."""
-    try:
-        df = fetch_price_volume_data(ticker)
-        df = calculate_rvol(df)
-        df = compute_atr(df)
-        signals = detect_gap_up(df, session_hours, threshold)
-        df = generate_trade_signals(df)
-        trades = backtest_strategy(df, signals)
-        stats = compute_backtest_stats(trades)
-        fig = plot_results(df, trades, ticker)
-        return {"ticker": ticker, "stats": stats, "plot": fig}
-    except Exception as e:
-        return {"ticker": ticker, "error": str(e)}
+st.title("RVol Gap-Up Backtesting Dashboard")
 
-def batch_backtest(tickers, session_hours, threshold=3.0, batch_size=5):
-    """Run batch backtest in chunks."""
-    results = []
-    for i in range(0, len(tickers), batch_size):
-        batch = tickers[i:i+batch_size]
-        for t in batch:
-            res = run_backtest_for_ticker(t, session_hours, threshold)
-            results.append(res)
-    return results
-
-# ------------------- Streamlit UI -------------------
-
-st.title("📊 RVol Gap-Up Multi-Asset Backtester")
-
-st.sidebar.header("Configuration")
+# Sidebar: Asset selection
+valid_defaults = [d for d in ["Gold", "EURUSD", "Crude Oil"] if d in TICKER_MAP.keys()]
 selected_assets = st.sidebar.multiselect(
-    "Select Assets", options=list(TICKER_MAP.keys()), default=["Gold", "EUR/USD", "Crude Oil"]
+    "Select Assets", 
+    options=list(TICKER_MAP.keys()), 
+    default=valid_defaults
 )
 
-session_choice = st.sidebar.selectbox(
-    "Select Session",
-    options={"Asia": [3, 4], "London": [10, 11], "NY": [16, 17]},
-    format_func=lambda x: [k for k, v in {"Asia": [3,4], "London": [10,11], "NY": [16,17]}.items() if v == x][0]
-)
+# Sidebar: Parameters
+threshold = st.sidebar.slider("Gap-Up Threshold", 1.0, 5.0, 2.0, 0.1)
+session = st.sidebar.selectbox("Trading Session", ["Asia", "London", "New York"])
+start_date = st.sidebar.date_input("Start Date", pd.to_datetime("2023-01-01"))
+end_date = st.sidebar.date_input("End Date", pd.to_datetime("today"))
 
-threshold = st.sidebar.slider("Gap-Up Threshold", 1.5, 5.0, 3.0, 0.1)
-
+# Run Backtest Button
 if st.sidebar.button("Run Backtest"):
-    st.write(f"### Running Backtests for {len(selected_assets)} Assets...")
-    results = batch_backtest([TICKER_MAP[a] for a in selected_assets], session_choice, threshold)
+    results = {}
+    for asset in selected_assets:
+        ticker = TICKER_MAP[asset]
+        df = fetch_price_volume(ticker, start=start_date, end=end_date, interval="1h")
+        df = calculate_rvol(df)
+        signals = detect_rvol_gapups(df, session=session, threshold=threshold)
+        stats = backtest_gapup_strategy(df, signals)
 
-    for res in results:
-        if "error" in res:
-            st.error(f"{res['ticker']} failed: {res['error']}")
-        else:
-            st.subheader(f"Results - {res['ticker']}")
-            st.write(res["stats"])
-            st.plotly_chart(res["plot"], use_container_width=True)
+        results[asset] = {
+            "signals": signals,
+            "stats": stats
+        }
+
+        st.subheader(f"📊 {asset}")
+        st.write("Backtest Stats:", stats)
+        plot_gapup_signals(df, signals, asset)
+
+    # Batch summary
+    st.subheader("📈 Batch Backtest Results")
+    summary_df = pd.DataFrame({a: r["stats"] for a, r in results.items()}).T
+    st.dataframe(summary_df)
+# ------------------- END CHUNK 3 -------------------
