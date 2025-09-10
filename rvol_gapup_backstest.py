@@ -1,26 +1,13 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 from yahooquery import Ticker
-import datetime
-import threading
+from datetime import timedelta
+import json
 from queue import Queue
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import time
+from threading import Thread
+import plotly.graph_objs as go
 
-st.set_page_config(layout="wide", page_title="RVol Gap-Up Backtester")
-
-st.title("RVol Gap-Up Strategy Backtester")
-st.markdown("""
-This dashboard backtests the Relative Volume (RVol) Gap-Up trading strategy using hourly data.
-The strategy identifies volume spikes at session opens and trades based on the subsequent candle pattern.
-""")
-
-# ------------------- Sidebar Inputs -------------------
-st.sidebar.header("Strategy Parameters")
-
-# Batch asset mapping
+# ------------------- Ticker maps (assets only, ETFs removed) -------------------
 TICKER_MAP = {
     "GOLD - COMMODITY EXCHANGE INC.": "GC=F",
     "EURO FX - CHICAGO MERCANTILE EXCHANGE": "6E=F",
@@ -33,178 +20,200 @@ TICKER_MAP = {
     "JAPANESE YEN - CHICAGO MERCANTILE EXCHANGE": "6J=F",
     "CANADIAN DOLLAR - CHICAGO MERCANTILE EXCHANGE": "6C=F",
     "BRITISH POUND - CHICAGO MERCANTILE EXCHANGE": "6B=F",
-    "U.S. DOLLAR INDEX - ICE FUTURES U.S.": "DX-Y.NYB",
     "NEW ZEALAND DOLLAR - CHICAGO MERCANTILE EXCHANGE": "6N=F",
     "SWISS FRANC - CHICAGO MERCANTILE EXCHANGE": "6S=F",
     "DOW JONES U.S. REAL ESTATE IDX - CHICAGO BOARD OF TRADE": "^DJI",
     "E-MINI S&P 500 STOCK INDEX - CHICAGO MERCANTILE EXCHANGE": "ES=F",
     "NASDAQ-100 STOCK INDEX (MINI) - CHICAGO MERCANTILE EXCHANGE": "NQ=F",
-    "NIKKEI STOCK AVERAGE - CHICAGO MERCANTILE EXCHANGE": "^N225",
     "SPDR S&P 500 ETF TRUST": "SPY",
     "COPPER - COMMODITY EXCHANGE INC.":"HG=F"
 }
 
-# Date range
-col1, col2 = st.sidebar.columns(2)
-start_date = col1.date_input("Start Date", datetime.date(2023, 1, 1))
-end_date = col2.date_input("End Date", datetime.date.today())
+# Remove ^N225 and DX-Y.NYB
+TICKER_MAP = {k: v for k, v in TICKER_MAP.items() if v not in ["^N225", "DX-Y.NYB"]}
 
-# RVol parameters
-rvol_window = st.sidebar.slider("RVol Window (hours)", 1, 24, 5)
-gap_threshold = st.sidebar.slider("Gap-Up Threshold", 1.0, 5.0, 2.0, 0.1)
+# All unique asset symbols
+asset_symbols = list(TICKER_MAP.values())
 
-# Risk management
-atr_window = st.sidebar.slider("ATR Window (hours)", 5, 48, 14)
-sl_multiplier = st.sidebar.slider("Stop Loss (x ATR)", 0.5, 3.0, 1.5, 0.1)
-tp_multiplier = st.sidebar.slider("Take Profit (x ATR)", 0.5, 5.0, 2.0, 0.1)
+# Load sector mapping from asset_category_map.json
+with open("asset_category_map.json", "r") as f:
+    ASSET_CATEGORY_MAP = json.load(f)
+ASSET_TO_SECTOR = {asset: sector for sector, assets in ASSET_CATEGORY_MAP.items() for asset in assets}
+TICKER_TO_NAME = {v: k for k, v in TICKER_MAP.items()}
 
-# Sessions
-sessions = st.sidebar.multiselect(
-    "Sessions to Test", ["Asian", "London", "New York"], ["Asian", "London", "New York"]
+# Constants
+DAYS = 730
+ROLLING_WINDOW = 120
+
+# ------------------- Streamlit UI -------------------
+st.title("RVol Gap-Up Backtesting Dashboard")
+if st.button("Rerun"):
+    st.rerun()
+
+market_open = st.sidebar.selectbox(
+    "Select Market Open Window:",
+    ["London (10:00-11:00)", "NY (16:00-17:00)", "Asian (3:00-4:00)"]
 )
 
-run_backtest = st.sidebar.button("Run Backtest")
+if market_open.startswith("London"):
+    open_hours = [10, 11]
+elif market_open.startswith("NY"):
+    open_hours = [16, 17]
+elif market_open.startswith("Asian"):
+    open_hours = [3, 4]
+else:
+    open_hours = [16, 17]
 
-# ------------------- Data Fetching Function -------------------
-def get_data(ticker_symbol, start_date, end_date):
-    try:
-        start_str = start_date.strftime('%Y-%m-%d')
-        end_str = end_date.strftime('%Y-%m-%d')
-        ticker = Ticker(ticker_symbol)
-        df = ticker.history(interval="1h", start=start_str, end=end_str)
+# ------------------- RVol Fetch -------------------
+@st.cache_data(show_spinner=True)
+def fetch_rvol_data(symbol):
+    t = Ticker(symbol, timeout=60)
+    hist = t.history(period=f"{DAYS}d", interval="1h")
+    if isinstance(hist, pd.DataFrame) and not hist.empty:
+        if isinstance(hist.index, pd.MultiIndex):
+            hist = hist.reset_index()
+        hist = hist.rename(columns={"symbol": "ticker"})
+        hist = hist.dropna(subset=["volume", "date"])
+        hist = hist[hist["volume"] > 0]
+        hist["datetime"] = pd.to_datetime(hist["date"], errors="coerce", utc=True)
+        hist = hist.dropna(subset=["datetime"])
+        hist = hist.sort_values("datetime")
+        # Convert to GMT+3
+        hist["datetime_gmt3"] = hist["datetime"] + timedelta(hours=3)
+        hist["datetime_gmt3"] = hist["datetime_gmt3"].dt.strftime("%Y-%m-%dT%H:%M:%S+03:00")
+        # RVol calculation
+        hist["avg_volume"] = hist["volume"].rolling(ROLLING_WINDOW).mean()
+        hist["rvol"] = hist["volume"] / hist["avg_volume"]
+        return hist
+    else:
+        return pd.DataFrame()
 
-        if isinstance(df.index, pd.MultiIndex):
-            df = df.reset_index().set_index('date')
-        
-        df.columns = [c.lower() for c in df.columns]
-        expected_cols = ['open', 'high', 'low', 'close', 'volume']
-        for col in expected_cols:
-            if col not in df.columns:
-                raise ValueError(f"Column {col} missing from {ticker_symbol} data")
-        
-        df.index = pd.to_datetime(df.index)
-        df = df.sort_index()
-        return df
-    except Exception as e:
-        return None, str(e)
-
-
-# ------------------- RVol & ATR Calculations -------------------
-def calculate_rvol(df, window=rvol_window):
-    df = df.copy()
-    df['avg_volume'] = df['volume'].rolling(window=window, min_periods=1).mean()
-    df['rvol'] = df['volume'] / df['avg_volume']
-    return df
-
-def calculate_atr(df, window=atr_window):
-    df = df.copy()
-    df['high_low'] = df['high'] - df['low']
-    df['high_close'] = np.abs(df['high'] - df['close'].shift(1))
-    df['low_close'] = np.abs(df['low'] - df['close'].shift(1))
-    df['tr'] = df[['high_low', 'high_close', 'low_close']].max(axis=1)
-    df['atr'] = df['tr'].rolling(window=window, min_periods=1).mean()
-    return df
 
 # ------------------- Gap-Up Detection -------------------
-def detect_gap_up(df, gap_threshold=gap_threshold):
+def detect_gap_up(df, open_hours):
+    if df.empty:
+        return None, None, None
     df = df.copy()
-    df['prev_close'] = df['close'].shift(1)
-    df['gap_up'] = (df['open'] - df['prev_close']) / df['prev_close'] * 100
-    df['gap_signal'] = df['gap_up'] >= gap_threshold
-    return df
+    df["datetime_gmt3_dt"] = pd.to_datetime(df["datetime_gmt3"], errors="coerce")
+    df = df.dropna(subset=["datetime_gmt3_dt"])
+    df = df.sort_values("datetime_gmt3_dt", ascending=False)
+    df["date_gmt3"] = df["datetime_gmt3_dt"].dt.date
+    df["hour_gmt3"] = df["datetime_gmt3_dt"].dt.hour
+    if df.empty:
+        return None, None, None
+    latest_day = df.iloc[0]["date_gmt3"]
+    prev_day = latest_day - pd.Timedelta(days=1)
+    # RVol for open hours
+    curr_open = df[(df["date_gmt3"] == latest_day) & (df["hour_gmt3"].isin(open_hours))]["rvol"]
+    prev_open = df[(df["date_gmt3"] == prev_day) & (df["hour_gmt3"].isin(open_hours))]["rvol"]
+    if curr_open.empty or prev_open.empty:
+        return None, None, None
+    curr_mean = curr_open.mean()
+    prev_mean = prev_open.mean()
+    if prev_mean == 0 or pd.isna(prev_mean):
+        return None, curr_mean, prev_mean
+    gap_ratio = curr_mean / prev_mean
+    return gap_ratio, curr_mean, prev_mean
 
-# ------------------- Signal Generation -------------------
-def generate_signals(df):
-    df = df.copy()
-    df['rvol_signal'] = df['rvol'] >= 1.0
-    df['long_signal'] = df['rvol_signal'] & df['gap_signal']
-    df['short_signal'] = False  # Optional for gap-down
-    return df
-
-# ------------------- Backtesting Function -------------------
-def backtest_asset(symbol, start_date, end_date, rvol_window, gap_threshold, atr_window, sl_multiplier, tp_multiplier, queue):
-    df = get_data(symbol, start_date, end_date)
-    if df is None or isinstance(df, tuple):
-        queue.put((symbol, None, f"Data fetch failed: {df[1]}"))
+# ------------------- Multi-Threaded Backtesting -------------------
+def process_asset(symbol, result_queue):
+    df = fetch_rvol_data(symbol)
+    if df.empty:
+        result_queue.put((symbol, None, None, None))
         return
-    
-    df = calculate_rvol(df, rvol_window)
-    df = calculate_atr(df, atr_window)
-    df = detect_gap_up(df, gap_threshold)
-    df = generate_signals(df)
+    gap_ratio, curr_rvol, prev_rvol = detect_gap_up(df, open_hours)
+    if gap_ratio is not None:
+        # Calculate historical percentile of current gap_ratio
+        historical_ratios = []
+        df["datetime_gmt3_dt"] = pd.to_datetime(df["datetime_gmt3"], errors="coerce")
+        df = df.dropna(subset=["datetime_gmt3_dt"])
+        df["date_gmt3"] = df["datetime_gmt3_dt"].dt.date
+        unique_dates = sorted(df["date_gmt3"].unique())
+        for i in range(1, len(unique_dates)):
+            day = unique_dates[i]
+            prev_day = unique_dates[i-1]
+            day_r = df[(df["date_gmt3"] == day) & (df["hour_gmt3"].isin(open_hours))]["rvol"].mean()
+            prev_day_r = df[(df["date_gmt3"] == prev_day) & (df["hour_gmt3"].isin(open_hours))]["rvol"].mean()
+            if pd.notna(day_r) and pd.notna(prev_day_r) and prev_day_r != 0:
+                historical_ratios.append(day_r / prev_day_r)
+        if historical_ratios:
+            percentile = (sum(r <= gap_ratio for r in historical_ratios) / len(historical_ratios)) * 100
+        else:
+            percentile = None
+    else:
+        percentile = None
+    result_queue.put((symbol, gap_ratio, curr_rvol, prev_rvol, percentile))
 
-    trades = []
-    for idx, row in df.iterrows():
-        if row['long_signal']:
-            entry = row['open']
-            sl = entry - row['atr'] * sl_multiplier
-            tp = entry + row['atr'] * tp_multiplier
-            trades.append({'date': idx, 'entry': entry, 'sl': sl, 'tp': tp, 'type': 'long'})
-    queue.put((symbol, df, trades))
-
-import threading
-import queue
-
-# ------------------- Multi-Asset Backtesting -------------------
-def run_backtest_multi_assets(assets, start_date, end_date, rvol_window, gap_threshold, atr_window, sl_multiplier, tp_multiplier):
-    q = queue.Queue()
+# ------------------- Run Multi-Threaded Backtest -------------------
+def run_backtest(assets):
     threads = []
-
-    # Start threads for each asset
+    result_queue = Queue()
     for symbol in assets:
-        t = threading.Thread(
-            target=backtest_asset,
-            args=(symbol, start_date, end_date, rvol_window, gap_threshold, atr_window, sl_multiplier, tp_multiplier, q)
-        )
-        t.start()
-        threads.append(t)
-
-    # Wait for threads to finish
-    for t in threads:
-        t.join()
-
-    # Collect results
-    results = {}
-    while not q.empty():
-        symbol, df, trades = q.get()
-        results[symbol] = {'data': df, 'trades': trades}
-
+        thread = Thread(target=process_asset, args=(symbol, result_queue))
+        thread.start()
+        threads.append(thread)
+    for thread in threads:
+        thread.join()
+    results = []
+    while not result_queue.empty():
+        results.append(result_queue.get())
     return results
 
-# ------------------- Streamlit Dashboard -------------------
-if run_backtest:
-    with st.spinner("Running multi-asset backtest..."):
-        assets = list(TICKER_MAP.values())  # Run all assets
-        results = run_backtest_multi_assets(
-            assets,
-            start_date,
-            end_date,
-            rvol_window,
-            gap_threshold,
-            atr_window,
-            sl_multiplier,
-            tp_multiplier
-        )
+# ------------------- Run Backtest and Display -------------------
+st.header("RVol Gap-Up Backtesting Results")
 
-    for symbol, result in results.items():
-        st.subheader(f"Asset: {symbol}")
-        df = result['data']
-        trades = result['trades']
+# Run backtest on all selected assets
+backtest_results = run_backtest(asset_symbols)
 
-        if df is None or trades is None:
-            st.error(f"Data or trades not available for {symbol}")
-            continue
+# Prepare DataFrame for display
+results_df = pd.DataFrame(backtest_results, columns=["Symbol", "Gap_Ratio", "Curr_RVol", "Prev_RVol", "Percentile"])
+results_df = results_df.dropna(subset=["Gap_Ratio"])
+results_df = results_df.sort_values("Percentile", ascending=False)
 
-        st.write(f"Number of trades: {len(trades)}")
+st.subheader("Gap-Up Percentiles")
+st.dataframe(results_df[["Symbol", "Gap_Ratio", "Curr_RVol", "Prev_RVol", "Percentile"]])
 
-        # Display trades
-        trade_df = pd.DataFrame(trades)
-        if not trade_df.empty:
-            trade_df['pnl'] = (trade_df['tp'] - trade_df['entry']) / trade_df['entry']
-            st.dataframe(trade_df, use_container_width=True)
+# ------------------- Distribution Plot -------------------
+import plotly.express as px
+fig_dist = px.histogram(results_df, x="Percentile", nbins=20, title="Distribution of Gap-Up Percentiles")
+st.plotly_chart(fig_dist, use_container_width=True)
 
-        # Plot price + RVol
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, subplot_titles=["Price", "Relative Volume"])
-        fig.add_trace(go.Candlestick(x=df.index, open=df['open'], high=df['high'], low=df['low'], close=df['close'], name="Price"), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['rvol'], mode='lines', name='RVol'), row=2, col=1)
-        st.plotly_chart(fig, use_container_width=True)
+# ------------------- Win Rate & RR -------------------
+# Example logic: consider percentile > 80 as "high gap"
+high_gap = results_df[results_df["Percentile"] >= 80]
+win_rate = len(high_gap) / len(results_df) if len(results_df) > 0 else 0
+# For illustration, reward-to-risk ratio set as gap_ratio / 1.0
+rr = high_gap["Gap_Ratio"].mean() if not high_gap.empty else 0
+st.markdown(f"**High Gap (>80th percentile) Win Rate:** {win_rate:.2%}")
+st.markdown(f"**Average Reward-to-Risk (R/R) for High Gap:** {rr:.2f}")
+
+# ------------------- Plot Latest Day RVol per Asset -------------------
+st.subheader("Latest Day Hourly RVol")
+for symbol in asset_symbols:
+    df = fetch_rvol_data(symbol)
+    if df.empty:
+        continue
+    df["datetime_gmt3_dt"] = pd.to_datetime(df["datetime_gmt3"], errors="coerce")
+    df = df.dropna(subset=["datetime_gmt3_dt"])
+    df = df.sort_values("datetime_gmt3_dt", ascending=False)
+    df["hour_gmt3"] = df["datetime_gmt3_dt"].dt.hour
+    df["date_gmt3"] = df["datetime_gmt3_dt"].dt.date
+    latest_day = df.iloc[0]["date_gmt3"]
+    day_df = df[df["date_gmt3"] == latest_day].copy()
+    if day_df.empty:
+        continue
+    chart_df = day_df.set_index("hour_gmt3")[["rvol"]].sort_index()
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=chart_df.index, y=chart_df["rvol"], name=f"{symbol} RVol", marker_color="blue"))
+    percentile_70 = df["rvol"].quantile(0.7)
+    fig.add_hline(y=percentile_70, line_width=3, line_dash="dash", line_color="red",
+                  annotation_text="70th percentile", annotation_position="top right")
+    fig.update_layout(
+        title=f"{symbol} — {latest_day}",
+        xaxis_title="Hour of Day (GMT+3)",
+        yaxis_title="RVol",
+        xaxis=dict(tickmode='array', tickvals=list(range(24)), ticktext=[str(h) for h in range(24)]),
+        yaxis=dict(rangemode="tozero"),
+        height=300
+    )
+    st.plotly_chart(fig, use_container_width=True, key=f"rvol-{symbol}")
