@@ -72,34 +72,10 @@ else:
 # -------------------------------
 # Functions
 # -------------------------------
-def detect_gap_up(df, open_hours, threshold=1.5):
-    if df.empty:
-        return False, None, None
-    df = df.copy()
-    df["datetime_gmt3_dt"] = pd.to_datetime(df["datetime_gmt3"], errors="coerce")
-    df = df.dropna(subset=["datetime_gmt3_dt"])
-    df = df.sort_values("datetime_gmt3_dt", ascending=False)
-    df["date_gmt3"] = df["datetime_gmt3_dt"].dt.date
-    df["hour_gmt3"] = df["datetime_gmt3_dt"].dt.hour
-    if df.empty:
-        return False, None, None
-    latest_day = df.iloc[0]["date_gmt3"]
-    prev_day = latest_day - pd.Timedelta(days=1)
-    curr_open = df[(df["date_gmt3"] == latest_day) & (df["hour_gmt3"].isin(open_hours))]["rvol"]
-    prev_open = df[(df["date_gmt3"] == prev_day) & (df["hour_gmt3"].isin(open_hours))]["rvol"]
-    if curr_open.empty or prev_open.empty:
-        return False, None, None
-    curr_mean = curr_open.mean()
-    prev_mean = prev_open.mean()
-    if prev_mean == 0 or pd.isna(prev_mean):
-        return False, curr_mean, prev_mean
-    gap_ratio = curr_mean / prev_mean
-    return gap_ratio >= threshold, curr_mean, prev_mean
-
 @st.cache_data(show_spinner=True)
-def fetch_rvol_data(symbol):
+def fetch_rvol_data(symbol, start_date=None, end_date=None):
     t = Ticker(symbol, timeout=60)
-    hist = t.history(period="730d", interval="1h")
+    hist = t.history(period=f"{DAYS}d", interval="1h")
     if isinstance(hist, pd.DataFrame) and not hist.empty:
         if isinstance(hist.index, pd.MultiIndex):
             hist = hist.reset_index()
@@ -109,15 +85,20 @@ def fetch_rvol_data(symbol):
         hist["datetime"] = pd.to_datetime(hist["date"], errors="coerce", utc=True)
         hist = hist.dropna(subset=["datetime"])
         hist = hist.sort_values("datetime")
+
         # Convert to GMT+3
         hist["datetime_gmt3"] = hist["datetime"] + timedelta(hours=3)
-        hist["datetime_gmt3"] = hist["datetime_gmt3"].dt.strftime("%Y-%m-%dT%H:%M:%S+03:00")
-        # Calculate rolling average volume and rvol
-        hist["avg_volume"] = hist["volume"].rolling(rolling_window).mean()
+        hist["datetime_gmt3_dt"] = pd.to_datetime(hist["datetime_gmt3"], errors="coerce")
+
+        # Filter by start_date / end_date
+        if start_date is not None:
+            hist = hist[hist["datetime_gmt3_dt"] >= pd.to_datetime(start_date)]
+        if end_date is not None:
+            hist = hist[hist["datetime_gmt3_dt"] <= pd.to_datetime(end_date)]
+
+        # Calculate avg_volume and rvol
+        hist["avg_volume"] = hist["volume"].rolling(ROLLING_WINDOW).mean()
         hist["rvol"] = hist["volume"] / hist["avg_volume"]
-        # Filter by backtesting date range
-        hist = hist[(hist["datetime_gmt3_dt"] := pd.to_datetime(hist["datetime_gmt3"], errors="coerce")) >= pd.to_datetime(start_date)]
-        hist = hist[hist["datetime_gmt3_dt"] <= pd.to_datetime(end_date)]
         return hist
     else:
         return pd.DataFrame()
