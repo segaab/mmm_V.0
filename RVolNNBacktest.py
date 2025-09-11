@@ -64,22 +64,42 @@ def calculate_rvol(df, window=5):
 # -------------------
 # Gap-Up Detection
 # -------------------
-def detect_gap_up(df, session_hours):
-    df = df.copy()
-    df["hour"] = df.index.hour
-    session_data = df[df["hour"].isin(session_hours)]
-
-    if len(session_data) < 2 * len(session_hours):
+def detect_gap_up(df, session_hours, threshold=2.0):
+    if df is None or df.empty:
         return None, None, None
-
-    latest_session = session_data.iloc[-len(session_hours):]
-    prev_session = session_data.iloc[-2*len(session_hours):-len(session_hours)]
-
-    curr_mean = latest_session["rvol"].mean()
-    prev_mean = prev_session["rvol"].mean()
-    gap_ratio = curr_mean / prev_mean if prev_mean > 0 else np.nan
-
+        
+    df = df.copy()
+    df = df.sort_index()  # Ensure chronological order
+    
+    # Extract date and hour information
+    df["date"] = df.index.date
+    df["hour"] = df.index.hour
+    
+    # Get unique dates in descending order
+    dates = sorted(df["date"].unique(), reverse=True)
+    if len(dates) < 2:
+        return None, None, None
+    
+    latest_day = dates[0]
+    prev_day = dates[1]
+    
+    # Get RVol data for session hours on both days
+    curr_open = df[(df["date"] == latest_day) & (df["hour"].isin(session_hours))]["rvol"]
+    prev_open = df[(df["date"] == prev_day) & (df["hour"].isin(session_hours))]["rvol"]
+    
+    if curr_open.empty or prev_open.empty:
+        return None, None, None
+        
+    curr_mean = curr_open.mean()
+    prev_mean = prev_open.mean()
+    
+    if prev_mean == 0 or pd.isna(prev_mean):
+        return None, curr_mean, prev_mean
+        
+    gap_ratio = curr_mean / prev_mean
+    
     return gap_ratio, curr_mean, prev_mean
+
 
 
 # -------------------
