@@ -32,15 +32,41 @@ TICKER_MAP = {
     "Nasdaq": "NQ=F",
 }
 
+ROLLING_WINDOW = 5  # Default RVol window
+
+# -------------------
+# Helper: Convert start/end to Yahooquery period
+# -------------------
+def date_range_to_period(start_date, end_date):
+    """
+    Convert a start_date and end_date to a Yahooquery-compatible period string.
+    Returns a string like '30d', '90d', etc.
+    """
+    if isinstance(start_date, str):
+        start_date = datetime.strptime(start_date, "%Y-%m-%d").date()
+    if isinstance(end_date, str):
+        end_date = datetime.strptime(end_date, "%Y-%m-%d").date()
+    
+    delta_days = (end_date - start_date).days
+    if delta_days < 1:
+        delta_days = 1
+    return f"{delta_days}d"
+
 # -------------------
 # Data Fetching + RVol Calculation
 # -------------------
 @st.cache_data(show_spinner=True)
-def fetch_rvol_data(symbol, start_date, end_date, window=5):
-    """Fetch hourly data, trim to date range, and compute RVol"""
+def fetch_rvol_data(symbol, start_date, end_date, window=ROLLING_WINDOW):
+    """Fetch hourly data and compute RVol using Yahooquery period"""
     try:
+        period = date_range_to_period(start_date, end_date)
         t = Ticker(symbol, timeout=60)
-        hist = t.history(start=start_date, end=end_date, interval="1h")
+        hist = t.history(period=period, interval="1h")
+
+        # Handle dictionary return
+        if isinstance(hist, dict):
+            key = list(hist.keys())[0]
+            hist = hist[key]
 
         if isinstance(hist, pd.DataFrame) and not hist.empty:
             if isinstance(hist.index, pd.MultiIndex):
@@ -50,7 +76,6 @@ def fetch_rvol_data(symbol, start_date, end_date, window=5):
             hist = hist.dropna(subset=["volume", "date"])
             hist = hist[hist["volume"] > 0]
 
-            # Parse datetime
             hist["datetime"] = pd.to_datetime(hist["date"], errors="coerce", utc=True)
             hist = hist.dropna(subset=["datetime"])
             hist = hist.sort_values("datetime")
@@ -63,7 +88,6 @@ def fetch_rvol_data(symbol, start_date, end_date, window=5):
             hist["avg_volume"] = hist["volume"].rolling(window).mean()
             hist["rvol"] = hist["volume"] / hist["avg_volume"]
 
-            # Keep only needed columns
             return hist[["open", "high", "low", "close", "volume", "rvol"]].dropna()
 
         return pd.DataFrame()
@@ -76,7 +100,6 @@ def fetch_rvol_data(symbol, start_date, end_date, window=5):
 # Gap-Up Detection
 # -------------------
 def detect_gap_up(df, session_hours, threshold=2.0):
-    """Detect gap-up in relative volume between consecutive days for specified session hours"""
     if df is None or df.empty:
         return None, None, None
 
@@ -84,7 +107,7 @@ def detect_gap_up(df, session_hours, threshold=2.0):
     df["date"] = df.index.date
     df["hour"] = df.index.hour
 
-    dates = sorted(df["date"].unique(), reverse=False)
+    dates = sorted(df["date"].unique())
     if len(dates) < 2:
         return None, None, None
 
@@ -117,8 +140,7 @@ def detect_gap_up(df, session_hours, threshold=2.0):
 # -------------------
 # Backtesting Logic
 # -------------------
-def backtest_asset(symbol, session_hours, start_date, end_date, threshold=2.0, window=5, holding_period=5):
-    """Backtest a single asset for RVol gap-up strategy"""
+def backtest_asset(symbol, session_hours, start_date, end_date, threshold=2.0, window=ROLLING_WINDOW, holding_period=5):
     df = fetch_rvol_data(symbol, start_date, end_date, window)
     if df is None or df.empty:
         return None, symbol
@@ -155,6 +177,9 @@ def backtest_asset(symbol, session_hours, start_date, end_date, threshold=2.0, w
                 })
 
     return trades, symbol
+
+
+
 
 # -------------------
 # Sidebar Settings
