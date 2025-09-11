@@ -5,8 +5,9 @@ from yahooquery import Ticker
 import plotly.express as px
 import plotly.graph_objs as go
 from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor
 import time
+import concurrent.futures
+from functools import partial
 
 st.set_page_config(layout="wide")
 st.title("📊 RVol Gap-Up Backtester")
@@ -170,8 +171,6 @@ def detect_gap_up(df, session_hours, threshold=2.0):
     date, ratio, curr, prev = results[-1]
     return ratio, curr, prev
 
-
-
 # -------------------
 # Backtesting Logic
 # -------------------
@@ -264,28 +263,23 @@ if st.sidebar.button("Run Backtest"):
     all_results = []
     total_assets = len(selected_assets)
     
-    with ThreadPoolExecutor() as executor:
-        futures = []
-        for i, symbol_name in enumerate(selected_assets):
-            symbol = TICKER_MAP[symbol_name]
-            status_text.text(f"Fetching data for {symbol_name}...")
-            
-            futures.append(
-                executor.submit(
-                    backtest_asset, symbol, session_hours, str(start_date), str(end_date), 
-                    threshold, rolling_window, holding_period
-                )
-            )
+    # Process one asset at a time instead of using ThreadPoolExecutor
+    for i, symbol_name in enumerate(selected_assets):
+        symbol = TICKER_MAP[symbol_name]
+        status_text.text(f"Fetching data for {symbol_name}...")
         
-        for i, future in enumerate(futures):
-            trades, symbol = future.result()
-            progress_bar.progress((i + 1) / total_assets)
-            status_text.text(f"Processed {symbol} ({i+1}/{total_assets})")
-            
-            if trades:
-                for t in trades:
-                    t["asset"] = [k for k, v in TICKER_MAP.items() if v == symbol][0]
-                    all_results.append(t)
+        trades, symbol = backtest_asset(
+            symbol, session_hours, str(start_date), str(end_date), 
+            threshold, rolling_window, holding_period
+        )
+        
+        progress_bar.progress((i + 1) / total_assets)
+        status_text.text(f"Processed {symbol} ({i+1}/{total_assets})")
+        
+        if trades:
+            for t in trades:
+                t["asset"] = [k for k, v in TICKER_MAP.items() if v == symbol][0]
+                all_results.append(t)
     
     progress_bar.empty()
     status_text.empty()
