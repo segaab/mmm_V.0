@@ -11,4 +11,13 @@ yahooquery
 torch
 scikit-learn
 plotly==5.15.0
+finage 
+newsapi-python 
+pandas 
+numpy 
+plotly 
+statsmodels 
+scikit-learn 
+textblob
+
 
