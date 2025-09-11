@@ -4,7 +4,7 @@ import numpy as np
 from yahooquery import Ticker
 import plotly.express as px
 import plotly.graph_objs as go
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import time
 
 st.set_page_config(layout="wide")
@@ -35,18 +35,20 @@ TICKER_MAP = {
 ROLLING_WINDOW = 5  # Default RVol window
 
 # -------------------
+# Year Selection Dropdown
+# -------------------
+year_range = list(range(2022, 2026))  # 2022–2025
+selected_year = st.sidebar.selectbox("Select Year", options=year_range)
+
+# Generate start_date and end_date for the selected year
+start_date = date(selected_year, 1, 1)
+end_date = date(selected_year, 12, 31)
+st.sidebar.write(f"Data Range: {start_date} to {end_date}")
+
+# -------------------
 # Helper: Convert start/end to Yahooquery period
 # -------------------
 def date_range_to_period(start_date, end_date):
-    """
-    Convert a start_date and end_date to a Yahooquery-compatible period string.
-    Returns a string like '30d', '90d', etc.
-    """
-    if isinstance(start_date, str):
-        start_date = datetime.strptime(start_date, "%Y-%m-%d").date()
-    if isinstance(end_date, str):
-        end_date = datetime.strptime(end_date, "%Y-%m-%d").date()
-    
     delta_days = (end_date - start_date).days
     if delta_days < 1:
         delta_days = 1
@@ -104,7 +106,7 @@ def detect_gap_up(df, session_hours, threshold=2.0):
         return None, None, None
 
     df = df.copy()
-    df["date"] = df.index.date
+    df["date"] = df.index.map(lambda x: x.date)  # Fixed AttributeError
     df["hour"] = df.index.hour
 
     dates = sorted(df["date"].unique())
@@ -146,18 +148,18 @@ def backtest_asset(symbol, session_hours, start_date, end_date, threshold=2.0, w
         return None, symbol
 
     trades = []
-    dates = sorted(df.index.date.unique())
+    dates = sorted(df.index.map(lambda x: x.date).unique())  # Fixed AttributeError
 
     for i in range(1, len(dates) - holding_period):
-        temp_df = df[df.index.date <= dates[i]].copy()
+        temp_df = df[df.index.map(lambda x: x.date) <= dates[i]].copy()
         gap_ratio, curr_mean, prev_mean = detect_gap_up(temp_df, session_hours, threshold)
 
         if gap_ratio is not None and gap_ratio >= threshold:
             entry_date = dates[i]
-            entry_price = df[df.index.date == entry_date]["close"].iloc[-1]
+            entry_price = df[df.index.map(lambda x: x.date) == entry_date]["close"].iloc[-1]
 
             exit_date = dates[i + holding_period]
-            exit_df = df[df.index.date == exit_date]
+            exit_df = df[df.index.map(lambda x: x.date) == exit_date]
 
             if not exit_df.empty:
                 exit_price = exit_df["close"].iloc[-1]
@@ -181,99 +183,18 @@ def backtest_asset(symbol, session_hours, start_date, end_date, threshold=2.0, w
 
 
 
-# -------------------
-# Sidebar Settings
-# -------------------
-st.sidebar.header("Backtesting Settings")
-
-start_date = st.sidebar.date_input("Start Date", pd.to_datetime("2023-01-01").date())
-end_date = st.sidebar.date_input("End Date", pd.to_datetime("2023-12-31").date())
-
-session_choice = st.sidebar.selectbox(
-    "Select Entry Session",
-    ["Asian (3-4 GMT+3)", "London (10-11 GMT+3)", "New York (16-17 GMT+3)"]
-)
-
-session_map = {
-    "Asian (3-4 GMT+3)": [3, 4],
-    "London (10-11 GMT+3)": [10, 11],
-    "New York (16-17 GMT+3)": [16, 17],
-}
-session_hours = session_map[session_choice]
-
-rolling_window = st.sidebar.number_input("RVol Rolling Window (hours)", min_value=3, max_value=50, value=5)
-threshold = st.sidebar.number_input("Gap-Up Threshold", min_value=1.1, max_value=5.0, value=2.0, step=0.1)
-holding_period = st.sidebar.number_input("Holding Period (days)", min_value=1, max_value=10, value=5)
-
-selected_assets = st.sidebar.multiselect(
-    "Select Assets", options=list(TICKER_MAP.keys()), default=["Gold", "EUR/USD", "Crude Oil"]
-)
-
-# -------------------
-# Run Backtest
-# -------------------
-if st.sidebar.button("Run Backtest"):
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    all_results = []
-    total_assets = len(selected_assets)
-
-    for i, symbol_name in enumerate(selected_assets):
-        symbol = TICKER_MAP[symbol_name]
-        status_text.text(f"Fetching data for {symbol_name}...")
-
-        trades, symbol = backtest_asset(
-            symbol, session_hours, str(start_date), str(end_date),
-            threshold, rolling_window, holding_period
-        )
-
-        progress_bar.progress((i + 1) / total_assets)
-        status_text.text(f"Processed {symbol} ({i+1}/{total_assets})")
-
-        if trades:
-            for t in trades:
-                t["asset"] = symbol_name
-                all_results.append(t)
-
-    progress_bar.empty()
-    status_text.empty()
-
-    # -------------------
-    # Display Results
-    # -------------------
-    if all_results:
-        df_results = pd.DataFrame(all_results)
-
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            win_rate = (df_results["pnl"] > 0).mean() * 100
-            st.metric("Win Rate", f"{win_rate:.2f}%")
-
-        with col2:
-            avg_return = df_results["return_pct"].mean()
-            st.metric("Avg Return", f"{avg_return:.2f}%")
-
-        with col3:
-            total_trades = len(df_results)
-            st.metric("Total Trades", total_trades)
-
-        with col4:
-            if len(df_results) > 1:
-                sharpe = df_results["return_pct"].mean() / df_results["return_pct"].std()
-                st.metric("Sharpe Ratio", f"{sharpe:.2f}")
-
-        st.subheader("Trade Details")
-        st.dataframe(df_results.sort_values("entry_date", ascending=False))
-
-        st.subheader("Return Distribution")
+st.subheader("Return Distribution")
         fig = px.histogram(
-            df_results, x="return_pct", nbins=20,
+            df_results,
+            x="return_pct",
+            nbins=20,
             title="Return Distribution (%)",
             color_discrete_sequence=["#3366CC"]
         )
         fig.add_vline(x=0, line_dash="dash", line_color="red")
         st.plotly_chart(fig, use_container_width=True)
 
+        # Performance by asset
         st.subheader("Performance by Asset")
         asset_perf = df_results.groupby("asset").agg({
             "return_pct": ["mean", "count"],
@@ -295,7 +216,12 @@ if st.sidebar.button("Run Backtest"):
             mode="markers",
             marker=dict(size=12, color="#FF9900")
         ))
-        fig2.update_layout(title="Performance by Asset", yaxis_title="Value")
+        fig2.update_layout(
+            title="Performance by Asset",
+            yaxis_title="Value",
+            xaxis_title="Asset",
+            legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
+        )
         st.plotly_chart(fig2, use_container_width=True)
 
     else:
