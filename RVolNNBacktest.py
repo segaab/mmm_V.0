@@ -6,6 +6,7 @@ import plotly.express as px
 import plotly.graph_objs as go
 from datetime import datetime, timedelta, date
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 st.set_page_config(layout="wide")
 st.title("📊 RVol Gap-Up Backtester")
@@ -32,21 +33,19 @@ TICKER_MAP = {
     "Nasdaq": "NQ=F",
 }
 
-ROLLING_WINDOW = 5  # Default RVol window
+ROLLING_WINDOW = 5  # default
 
 # -------------------
 # Year Selection Dropdown
 # -------------------
-year_range = list(range(2022, 2026))  # 2022–2025
+year_range = list(range(2022, 2026))
 selected_year = st.sidebar.selectbox("Select Year", options=year_range)
-
-# Generate start_date and end_date for the selected year
 start_date = date(selected_year, 1, 1)
 end_date = date(selected_year, 12, 31)
 st.sidebar.write(f"Data Range: {start_date} to {end_date}")
 
 # -------------------
-# Helper: Convert start/end to Yahooquery period
+# Helper: Convert date range to Yahooquery period
 # -------------------
 def date_range_to_period(start_date, end_date):
     delta_days = (end_date - start_date).days
@@ -55,17 +54,15 @@ def date_range_to_period(start_date, end_date):
     return f"{delta_days}d"
 
 # -------------------
-# Data Fetching + RVol Calculation
+# Fetch data and calculate RVol
 # -------------------
-@st.cache_data(show_spinner=True)
 def fetch_rvol_data(symbol, start_date, end_date, window=ROLLING_WINDOW):
-    """Fetch hourly data and compute RVol using Yahooquery period"""
     try:
         period = date_range_to_period(start_date, end_date)
         t = Ticker(symbol, timeout=60)
         hist = t.history(period=period, interval="1h")
 
-        # Handle dictionary return
+        # Handle dictionary format
         if isinstance(hist, dict):
             key = list(hist.keys())[0]
             hist = hist[key]
@@ -86,17 +83,37 @@ def fetch_rvol_data(symbol, start_date, end_date, window=ROLLING_WINDOW):
             hist["datetime_gmt3"] = hist["datetime"] + timedelta(hours=3)
             hist.set_index("datetime_gmt3", inplace=True)
 
-            # Calculate avg_volume and rvol
+            # Calculate RVol
             hist["avg_volume"] = hist["volume"].rolling(window).mean()
             hist["rvol"] = hist["volume"] / hist["avg_volume"]
 
             return hist[["open", "high", "low", "close", "volume", "rvol"]].dropna()
 
         return pd.DataFrame()
-
     except Exception as e:
         st.error(f"Error fetching {symbol}: {str(e)}")
         return pd.DataFrame()
+
+# -------------------
+# Threaded fetching (process then cache)
+# -------------------
+def fetch_process(symbol):
+    df = fetch_rvol_data(symbol, start_date, end_date, ROLLING_WINDOW)
+    return symbol, df
+
+def fetch_all_tickers(tickers):
+    results = {}
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(fetch_process, symbol): symbol for symbol in tickers}
+        for future in as_completed(futures):
+            symbol, df = future.result()
+            results[symbol] = df
+    return results
+
+@st.cache_data(show_spinner=True)
+def get_all_rvol_data(selected_assets):
+    symbols = [TICKER_MAP[a] for a in selected_assets]
+    return fetch_all_tickers(symbols)
 
 # -------------------
 # Gap-Up Detection
@@ -106,7 +123,7 @@ def detect_gap_up(df, session_hours, threshold=2.0):
         return None, None, None
 
     df = df.copy()
-    df["date"] = df.index.map(lambda x: x.date)  # Fixed AttributeError
+    df["date"] = df.index.map(lambda x: x.date)
     df["hour"] = df.index.hour
 
     dates = sorted(df["date"].unique())
@@ -142,13 +159,13 @@ def detect_gap_up(df, session_hours, threshold=2.0):
 # -------------------
 # Backtesting Logic
 # -------------------
-def backtest_asset(symbol, session_hours, start_date, end_date, threshold=2.0, window=ROLLING_WINDOW, holding_period=5):
-    df = fetch_rvol_data(symbol, start_date, end_date, window)
+def backtest_asset(symbol, session_hours, threshold=2.0, holding_period=5):
+    df = all_data.get(symbol)
     if df is None or df.empty:
         return None, symbol
 
     trades = []
-    dates = sorted(df.index.map(lambda x: x.date).unique())  # Fixed AttributeError
+    dates = sorted(df.index.map(lambda x: x.date).unique())
 
     for i in range(1, len(dates) - holding_period):
         temp_df = df[df.index.map(lambda x: x.date) <= dates[i]].copy()
@@ -182,8 +199,82 @@ def backtest_asset(symbol, session_hours, start_date, end_date, threshold=2.0, w
 
 
 
+# -------------------
+# Sidebar Session Settings
+# -------------------
+session_choice = st.sidebar.selectbox(
+    "Select Entry Session",
+    ["Asian (3-4 GMT+3)", "London (10-11 GMT+3)", "New York (16-17 GMT+3)"]
+)
 
-st.subheader("Return Distribution")
+session_map = {
+    "Asian (3-4 GMT+3)": [3, 4],
+    "London (10-11 GMT+3)": [10, 11],
+    "New York (16-17 GMT+3)": [16, 17],
+}
+session_hours = session_map[session_choice]
+
+rolling_window = st.sidebar.number_input("RVol Rolling Window (hours)", min_value=3, max_value=50, value=5)
+threshold = st.sidebar.number_input("Gap-Up Threshold", min_value=1.1, max_value=5.0, value=2.0, step=0.1)
+holding_period = st.sidebar.number_input("Holding Period (days)", min_value=1, max_value=10, value=5)
+
+selected_assets = st.sidebar.multiselect(
+    "Select Assets", options=list(TICKER_MAP.keys()), default=["Gold", "EUR/USD", "Crude Oil"]
+)
+
+# -------------------
+# Fetch all data once (threaded + cached)
+# -------------------
+all_data = get_all_rvol_data(selected_assets)
+
+# -------------------
+# Run Backtest
+# -------------------
+if st.sidebar.button("Run Backtest"):
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    all_results = []
+    total_assets = len(selected_assets)
+
+    for i, symbol_name in enumerate(selected_assets):
+        symbol = TICKER_MAP[symbol_name]
+        status_text.text(f"Processing {symbol_name}...")
+
+        trades, symbol = backtest_asset(symbol, session_hours, threshold, holding_period)
+
+        progress_bar.progress((i + 1) / total_assets)
+        status_text.text(f"Processed {symbol_name} ({i+1}/{total_assets})")
+
+        if trades:
+            for t in trades:
+                t["asset"] = symbol_name
+                all_results.append(t)
+
+    progress_bar.empty()
+    status_text.empty()
+
+    if all_results:
+        df_results = pd.DataFrame(all_results)
+
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            win_rate = (df_results["pnl"] > 0).mean() * 100
+            st.metric("Win Rate", f"{win_rate:.2f}%")
+        with col2:
+            avg_return = df_results["return_pct"].mean()
+            st.metric("Avg Return", f"{avg_return:.2f}%")
+        with col3:
+            total_trades = len(df_results)
+            st.metric("Total Trades", total_trades)
+        with col4:
+            if len(df_results) > 1:
+                sharpe = df_results["return_pct"].mean() / df_results["return_pct"].std()
+                st.metric("Sharpe Ratio", f"{sharpe:.2f}")
+
+        st.subheader("Trade Details")
+        st.dataframe(df_results.sort_values("entry_date", ascending=False))
+
+        st.subheader("Return Distribution")
         fig = px.histogram(
             df_results,
             x="return_pct",
@@ -194,7 +285,6 @@ st.subheader("Return Distribution")
         fig.add_vline(x=0, line_dash="dash", line_color="red")
         st.plotly_chart(fig, use_container_width=True)
 
-        # Performance by asset
         st.subheader("Performance by Asset")
         asset_perf = df_results.groupby("asset").agg({
             "return_pct": ["mean", "count"],
