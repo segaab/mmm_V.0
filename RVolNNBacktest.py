@@ -62,7 +62,7 @@ def fetch_rvol_data(symbol, start_date, end_date, window=ROLLING_WINDOW):
         t = Ticker(symbol, timeout=60)
         hist = t.history(period=period, interval="1h")
 
-        # Handle dictionary format
+        # Handle dict response
         if isinstance(hist, dict):
             key = list(hist.keys())[0]
             hist = hist[key]
@@ -79,16 +79,21 @@ def fetch_rvol_data(symbol, start_date, end_date, window=ROLLING_WINDOW):
             hist = hist.dropna(subset=["datetime"])
             hist = hist.sort_values("datetime")
 
-            # Convert to GMT+3
+            # Convert to GMT+3 for display
             hist["datetime_gmt3"] = hist["datetime"] + timedelta(hours=3)
             hist.set_index("datetime_gmt3", inplace=True)
 
-            # Calculate RVol
+            # Ensure numeric and remove NaN from rolling
             hist["avg_volume"] = hist["volume"].rolling(window).mean()
             hist["rvol"] = hist["volume"] / hist["avg_volume"]
+            hist = hist.dropna(subset=["rvol", "close"])
 
-            return hist[["open", "high", "low", "close", "volume", "rvol"]].dropna()
+            # Ensure index is datetime
+            hist.index = pd.to_datetime(hist.index)
 
+            return hist[["open", "high", "low", "close", "volume", "rvol"]]
+
+        st.warning(f"No data returned for {symbol}")
         return pd.DataFrame()
     except Exception as e:
         st.error(f"Error fetching {symbol}: {str(e)}")
@@ -111,7 +116,7 @@ def fetch_all_tickers(tickers):
     return results
 
 @st.cache_data(show_spinner=True)
-def get_all_rvol_data(selected_assets):
+def get_all_rvol_data(selected_assets, start_date, end_date, window, threshold):
     symbols = [TICKER_MAP[a] for a in selected_assets]
     return fetch_all_tickers(symbols)
 
@@ -123,7 +128,7 @@ def detect_gap_up(df, session_hours, threshold=2.0):
         return None, None, None
 
     df = df.copy()
-    df["date"] = df.index.map(lambda x: x.date)
+    df["date"] = df.index.date
     df["hour"] = df.index.hour
 
     dates = sorted(df["date"].unique())
@@ -156,76 +161,8 @@ def detect_gap_up(df, session_hours, threshold=2.0):
     date, ratio, curr, prev = results[-1]
     return ratio, curr, prev
 
-# -------------------
-# Backtesting Logic
-# -------------------
-def backtest_asset(symbol, session_hours, threshold=2.0, holding_period=5):
-    df = all_data.get(symbol)
-    if df is None or df.empty:
-        return None, symbol
-
-    trades = []
-    dates = sorted(df.index.map(lambda x: x.date).unique())
-
-    for i in range(1, len(dates) - holding_period):
-        temp_df = df[df.index.map(lambda x: x.date) <= dates[i]].copy()
-        gap_ratio, curr_mean, prev_mean = detect_gap_up(temp_df, session_hours, threshold)
-
-        if gap_ratio is not None and gap_ratio >= threshold:
-            entry_date = dates[i]
-            entry_price = df[df.index.map(lambda x: x.date) == entry_date]["close"].iloc[-1]
-
-            exit_date = dates[i + holding_period]
-            exit_df = df[df.index.map(lambda x: x.date) == exit_date]
-
-            if not exit_df.empty:
-                exit_price = exit_df["close"].iloc[-1]
-                pnl = exit_price - entry_price
-                pct_return = (exit_price / entry_price - 1) * 100
-
-                trades.append({
-                    "entry_date": entry_date,
-                    "exit_date": exit_date,
-                    "entry_price": entry_price,
-                    "exit_price": exit_price,
-                    "pnl": pnl,
-                    "return_pct": pct_return,
-                    "gap_ratio": gap_ratio,
-                    "rvol_curr": curr_mean,
-                    "rvol_prev": prev_mean
-                })
-
-    return trades, symbol
 
 
-
-# -------------------
-# Sidebar Session Settings
-# -------------------
-session_choice = st.sidebar.selectbox(
-    "Select Entry Session",
-    ["Asian (3-4 GMT+3)", "London (10-11 GMT+3)", "New York (16-17 GMT+3)"]
-)
-
-session_map = {
-    "Asian (3-4 GMT+3)": [3, 4],
-    "London (10-11 GMT+3)": [10, 11],
-    "New York (16-17 GMT+3)": [16, 17],
-}
-session_hours = session_map[session_choice]
-
-rolling_window = st.sidebar.number_input("RVol Rolling Window (hours)", min_value=3, max_value=50, value=5)
-threshold = st.sidebar.number_input("Gap-Up Threshold", min_value=1.1, max_value=5.0, value=2.0, step=0.1)
-holding_period = st.sidebar.number_input("Holding Period (days)", min_value=1, max_value=10, value=5)
-
-selected_assets = st.sidebar.multiselect(
-    "Select Assets", options=list(TICKER_MAP.keys()), default=["Gold", "EUR/USD", "Crude Oil"]
-)
-
-# -------------------
-# Fetch all data once (threaded + cached)
-# -------------------
-all_data = get_all_rvol_data(selected_assets)
 
 # -------------------
 # Run Backtest
@@ -238,12 +175,11 @@ if st.sidebar.button("Run Backtest"):
 
     for i, symbol_name in enumerate(selected_assets):
         symbol = TICKER_MAP[symbol_name]
-        status_text.text(f"Processing {symbol_name}...")
+        status_text.text(f"Processing {symbol_name} ({i+1}/{total_assets})...")
 
         trades, symbol = backtest_asset(symbol, session_hours, threshold, holding_period)
 
         progress_bar.progress((i + 1) / total_assets)
-        status_text.text(f"Processed {symbol_name} ({i+1}/{total_assets})")
 
         if trades:
             for t in trades:
@@ -253,27 +189,36 @@ if st.sidebar.button("Run Backtest"):
     progress_bar.empty()
     status_text.empty()
 
+    # -------------------
+    # Display Results
+    # -------------------
     if all_results:
         df_results = pd.DataFrame(all_results)
 
+        # Summary metrics
         col1, col2, col3, col4 = st.columns(4)
         with col1:
             win_rate = (df_results["pnl"] > 0).mean() * 100
             st.metric("Win Rate", f"{win_rate:.2f}%")
+
         with col2:
             avg_return = df_results["return_pct"].mean()
             st.metric("Avg Return", f"{avg_return:.2f}%")
+
         with col3:
             total_trades = len(df_results)
             st.metric("Total Trades", total_trades)
+
         with col4:
             if len(df_results) > 1:
                 sharpe = df_results["return_pct"].mean() / df_results["return_pct"].std()
                 st.metric("Sharpe Ratio", f"{sharpe:.2f}")
 
+        # Trades table
         st.subheader("Trade Details")
         st.dataframe(df_results.sort_values("entry_date", ascending=False))
 
+        # Return distribution
         st.subheader("Return Distribution")
         fig = px.histogram(
             df_results,
@@ -285,6 +230,7 @@ if st.sidebar.button("Run Backtest"):
         fig.add_vline(x=0, line_dash="dash", line_color="red")
         st.plotly_chart(fig, use_container_width=True)
 
+        # Performance by asset
         st.subheader("Performance by Asset")
         asset_perf = df_results.groupby("asset").agg({
             "return_pct": ["mean", "count"],
@@ -306,15 +252,10 @@ if st.sidebar.button("Run Backtest"):
             mode="markers",
             marker=dict(size=12, color="#FF9900")
         ))
-        fig2.update_layout(
-            title="Performance by Asset",
-            yaxis_title="Value",
-            xaxis_title="Asset",
-            legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
-        )
+        fig2.update_layout(title="Performance by Asset", yaxis_title="Value")
         st.plotly_chart(fig2, use_container_width=True)
 
     else:
-        st.warning("No trades generated in the selected period. Try adjusting parameters or selecting different assets.")
+        st.warning("No trades generated in the selected period. Adjust parameters or select different assets.")
 else:
     st.info("Configure the backtest parameters in the sidebar and click 'Run Backtest' to start.")
