@@ -20,4 +20,5 @@ statsmodels
 scikit-learn 
 textblob
 kaggle 
+dotenv
 
